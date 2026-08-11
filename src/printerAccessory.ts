@@ -1,6 +1,5 @@
 import { Service, PlatformAccessory } from 'homebridge';
 import * as mqtt from 'mqtt';
-import { spawn } from 'child_process';
 import { BambuPrintStatusPlatform } from './platform';
 import { BAMBU_ERROR_CODES, KNOWN_FILAMENT_RUNOUT_CODES } from './bambuErrorCodes';
 
@@ -39,12 +38,16 @@ export interface PrinterConfig {
   // Set to 0 to disable. Defaults to 5.
   progressNotificationIntervalPercent?: number;
 
-  // Attaches a live camera snapshot to notifications. Requires ffmpeg on PATH
-  // (or ffmpegPath below) and a GitHub fine-grained PAT scoped to just
-  // "Contents: read and write" on githubRepo - the snapshot gets uploaded there
-  // (overwriting one fixed file each time) and referenced via its raw URL.
+  // Attaches a live camera snapshot (as the notification icon, shown immediately
+  // rather than only on tap) pulled from camera.ui's own REST API - reuses the
+  // connection camera.ui already holds rather than opening a second one to the
+  // printer. Uploaded to a public GitHub repo via the Contents API (overwriting
+  // one fixed file each time) since Pingie's servers need a public HTTPS URL.
   includeCameraSnapshot?: boolean;
-  ffmpegPath?: string;
+  cameraUiBaseUrl?: string;
+  cameraUiUsername?: string;
+  cameraUiPassword?: string;
+  cameraUiCameraName?: string;
   githubToken?: string;
   githubOwner?: string;
   githubRepo?: string;
@@ -73,6 +76,8 @@ export class BambuPrinterAccessory {
   private printStartTimestamp?: number;
   private printEstimatedTotalMinutes?: number;
   private lastNotifiedProgressBucket = -1;
+  private cameraUiToken?: string;
+  private cameraUiTokenExpiresAt = 0;
 
   // Bambu printers send partial diffs after the first message, so we keep a
   // merged copy of everything we've seen rather than trusting any single message.
@@ -335,61 +340,83 @@ export class BambuPrinterAccessory {
     this.platform.log.info(`[${this.printerConfig.name}] Chamber light -> ${on ? 'ON' : 'OFF'}`);
   }
 
-  // Captures a single JPEG frame from the printer's RTSPS stream via ffmpeg,
-  // piped directly to stdout (no temp file). Returns undefined on any failure -
-  // callers should treat a missing snapshot as non-fatal, never blocking the
-  // underlying text notification.
-  private async captureSnapshot(): Promise<Buffer | undefined> {
-    const ffmpegPath = this.printerConfig.ffmpegPath ?? 'ffmpeg';
-    const rtspUrl =
-      `rtsps://${this.printerConfig.mqttUsername ?? 'bblp'}:${this.printerConfig.lanAccessCode}` +
-      `@${this.printerConfig.ipAddress}:322/streaming/live/1`;
+  // Logs into camera.ui and caches the JWT until it's close to expiring.
+  // Returns undefined if camera.ui isn't configured or login fails.
+  private async getCameraUiToken(): Promise<string | undefined> {
+    const { cameraUiBaseUrl, cameraUiUsername, cameraUiPassword } = this.printerConfig;
+    if (!cameraUiBaseUrl || !cameraUiUsername || !cameraUiPassword) {
+      return undefined;
+    }
 
-    return new Promise((resolve) => {
-      const args = [
-        '-tls_verify', '0',
-        '-rtsp_transport', 'tcp',
-        '-i', rtspUrl,
-        '-frames:v', '1',
-        '-f', 'image2pipe',
-        '-vcodec', 'mjpeg',
-        'pipe:1',
-      ];
-      const proc = spawn(ffmpegPath, args);
-      const chunks: Buffer[] = [];
-      let settled = false;
+    // Refresh a bit before actual expiry rather than cutting it exactly fine.
+    if (this.cameraUiToken && Date.now() < this.cameraUiTokenExpiresAt - 30_000) {
+      return this.cameraUiToken;
+    }
 
-      const timeout = setTimeout(() => {
-        if (!settled) {
-          settled = true;
-          proc.kill('SIGKILL');
-          this.platform.log.warn(`[${this.printerConfig.name}] Snapshot capture timed out.`);
-          resolve(undefined);
-        }
-      }, 15_000);
-
-      proc.stdout.on('data', (chunk: Buffer) => chunks.push(chunk));
-      proc.on('error', (err) => {
-        if (!settled) {
-          settled = true;
-          clearTimeout(timeout);
-          this.platform.log.warn(`[${this.printerConfig.name}] Snapshot capture failed to start: ${err.message}`);
-          resolve(undefined);
-        }
+    try {
+      const res = await fetch(`${cameraUiBaseUrl}/api/auth/login`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ username: cameraUiUsername, password: cameraUiPassword }),
       });
-      proc.on('close', (code) => {
-        if (!settled) {
-          settled = true;
-          clearTimeout(timeout);
-          if (code === 0 && chunks.length > 0) {
-            resolve(Buffer.concat(chunks));
-          } else {
-            this.platform.log.warn(`[${this.printerConfig.name}] Snapshot capture exited with code ${code}.`);
-            resolve(undefined);
-          }
-        }
-      });
-    });
+      if (!res.ok) {
+        this.platform.log.warn(`[${this.printerConfig.name}] camera.ui login failed (${res.status}).`);
+        return undefined;
+      }
+      const body = (await res.json()) as { access_token?: string; expires_in?: number };
+      if (!body.access_token) {
+        this.platform.log.warn(`[${this.printerConfig.name}] camera.ui login response had no access_token.`);
+        return undefined;
+      }
+      this.cameraUiToken = body.access_token;
+      this.cameraUiTokenExpiresAt = Date.now() + (body.expires_in ?? 3600) * 1000;
+      return this.cameraUiToken;
+    } catch (err) {
+      this.platform.log.warn(`[${this.printerConfig.name}] camera.ui login error: ${(err as Error).message}`);
+      return undefined;
+    }
+  }
+
+  // Pulls a snapshot from camera.ui's own cached camera feed rather than
+  // opening a second connection to the printer directly. Retries once with a
+  // fresh login if the cached token turns out to be stale (401).
+  private async captureSnapshotFromCameraUi(): Promise<Buffer | undefined> {
+    const { cameraUiBaseUrl, cameraUiCameraName } = this.printerConfig;
+    if (!cameraUiBaseUrl || !cameraUiCameraName) {
+      return undefined;
+    }
+
+    const attempt = async (forceRelogin: boolean): Promise<Buffer | undefined> => {
+      if (forceRelogin) {
+        this.cameraUiToken = undefined;
+      }
+      const token = await this.getCameraUiToken();
+      if (!token) {
+        return undefined;
+      }
+      const url =
+        `${cameraUiBaseUrl}/api/cameras/${encodeURIComponent(cameraUiCameraName)}/snapshot` +
+        '?buffer=true';
+      const res = await fetch(url, { headers: { Authorization: `Bearer ${token}` } });
+      if (res.status === 401 && !forceRelogin) {
+        return attempt(true);
+      }
+      if (!res.ok) {
+        this.platform.log.warn(
+          `[${this.printerConfig.name}] camera.ui snapshot failed (${res.status}) for camera "${cameraUiCameraName}".`,
+        );
+        return undefined;
+      }
+      const arrayBuffer = await res.arrayBuffer();
+      return Buffer.from(arrayBuffer);
+    };
+
+    try {
+      return await attempt(false);
+    } catch (err) {
+      this.platform.log.warn(`[${this.printerConfig.name}] camera.ui snapshot error: ${(err as Error).message}`);
+      return undefined;
+    }
   }
 
   // Uploads a JPEG to GitHub via the Contents API, overwriting one fixed file
@@ -411,8 +438,6 @@ export class BambuPrinterAccessory {
     };
 
     try {
-      // Fetch the current file's sha if it exists - required by the Contents
-      // API to overwrite rather than create a duplicate/conflict.
       let sha: string | undefined;
       const existing = await fetch(`${apiUrl}?ref=${encodeURIComponent(branch)}`, { headers });
       if (existing.ok) {
@@ -448,24 +473,24 @@ export class BambuPrinterAccessory {
     }
   }
 
-  // Wraps sendPingieNotification with an optional live snapshot attached.
+  // Wraps sendPingieNotification with an optional live snapshot as the icon.
   // Falls back to a plain text-only notification if capture/upload fails or
   // includeCameraSnapshot isn't enabled - never blocks the underlying alert.
   private async sendPingieNotificationWithSnapshot(title: string, text: string) {
     if (!this.printerConfig.includeCameraSnapshot) {
       return this.sendPingieNotification(title, text);
     }
-    const jpeg = await this.captureSnapshot();
+    const jpeg = await this.captureSnapshotFromCameraUi();
     const snapshotUrl = jpeg ? await this.uploadSnapshotToGithub(jpeg) : undefined;
     return this.sendPingieNotification(title, text, snapshotUrl);
   }
 
-  private async sendPingieNotification(title: string, text: string, overrideImageUrl?: string) {
+  private async sendPingieNotification(title: string, text: string, overrideIconUrl?: string) {
     const { pingieGroupId, pingieGroupToken, pingieIconUrl, pingieImageUrl } = this.printerConfig;
     if (!pingieGroupId || !pingieGroupToken) {
       return; // notifications not configured - silently skip
     }
-    const imageUrl = overrideImageUrl ?? pingieImageUrl;
+    const iconUrl = overrideIconUrl ?? pingieIconUrl;
     try {
       const url =
         `https://notifypush.pingie.com/notify-json/${encodeURIComponent(pingieGroupId)}` +
@@ -477,8 +502,8 @@ export class BambuPrinterAccessory {
           text,
           title,
           groupType: 'bambu-print-status',
-          ...(pingieIconUrl ? { iconUrl: pingieIconUrl } : {}),
-          ...(imageUrl ? { imageUrl } : {}),
+          ...(iconUrl ? { iconUrl } : {}),
+          ...(pingieImageUrl ? { imageUrl: pingieImageUrl } : {}),
         }),
       });
       if (!res.ok) {

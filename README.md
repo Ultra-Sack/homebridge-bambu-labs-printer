@@ -185,27 +185,31 @@ raw numeric code instead of guessing.
 
 ## Live camera snapshots in notifications
 
-Setting `includeCameraSnapshot: true` attaches a current frame from the printer's
-camera to every notification. Since Pingie's servers fetch the image URL
-themselves (not your phone), it has to be reachable from the public internet -
-this works by grabbing a frame via `ffmpeg` and uploading it to a **public**
-GitHub repo via the Contents API, overwriting one fixed file (`githubSnapshotPath`)
-each time, then linking to it via `raw.githubusercontent.com` with a timestamp
-query param so the CDN doesn't serve a stale cached copy.
+Setting `includeCameraSnapshot: true` attaches a current camera frame to
+notifications, shown as the icon (visible immediately in the notification, not
+only when tapped). Since Pingie's servers fetch the URL themselves, it has to
+be publicly reachable - this works by pulling the snapshot from **camera.ui's
+own REST API** (reusing the connection camera.ui already holds with the
+printer, rather than opening a second competing one), then uploading it to a
+**public** GitHub repo via the Contents API, overwriting one fixed file
+(`githubSnapshotPath`) each time and linking to it via `raw.githubusercontent.com`
+with a timestamp query param so the CDN doesn't serve a stale cached copy.
 
 Requirements:
-- `ffmpeg` available on the Homebridge host (set `ffmpegPath` if it's not on PATH)
+- camera.ui reachable at `cameraUiBaseUrl`, with the printer already added as a
+  camera there under `cameraUiCameraName` (must match its exact registered name)
+- A camera.ui username/password with access to that camera - consider a
+  dedicated low-privilege account rather than your main admin login, since the
+  credentials sit in plugin config
 - A **public** GitHub repo (private repos return 404/login to unauthenticated
   fetchers like Pingie)
 - A GitHub **fine-grained** Personal Access Token scoped to only
-  "Contents: read and write" on that one repo - not a broad classic token,
-  since it lives in plugin config
+  "Contents: read and write" on that one repo
 
-This adds a few seconds of latency to each notification while the frame is
-captured and uploaded, and each upload is a real commit to the repo, so its
-history will grow steadily over time. If capture or upload fails for any
-reason, the notification still sends as plain text - a missing snapshot never
-blocks the underlying alert.
+The plugin logs into camera.ui once, caches the JWT until shortly before it
+expires, and re-logs-in automatically - no manual token refresh needed. If
+capture or upload fails for any reason, the notification still sends as plain
+text; a missing snapshot never blocks the underlying alert.
 
 ## Filament run-out setup
 
