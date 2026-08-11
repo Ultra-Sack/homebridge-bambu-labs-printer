@@ -1,0 +1,121 @@
+{
+  "pluginAlias": "BambuPrintStatus",
+  "pluginType": "platform",
+  "singular": true,
+  "headerDisplay": "Exposes each Bambu Lab printer's print status as a HomeKit Occupancy Sensor (occupied while actively printing) for use in automations.",
+  "schema": {
+    "type": "object",
+    "properties": {
+      "name": {
+        "title": "Platform Name",
+        "type": "string",
+        "default": "Bambu Print Status"
+      },
+      "printers": {
+        "title": "Printers",
+        "type": "array",
+        "items": {
+          "type": "object",
+          "properties": {
+            "name": {
+              "title": "Name",
+              "type": "string",
+              "default": "X1 Carbon",
+              "required": true
+            },
+            "ipAddress": {
+              "title": "IP Address",
+              "type": "string",
+              "required": true,
+              "description": "Must be static or DHCP-reserved - the plugin connects directly to this address."
+            },
+            "serialNumber": {
+              "title": "Serial Number",
+              "type": "string",
+              "required": true,
+              "description": "Settings > General on the printer, or the Bambu Handy app device info."
+            },
+            "lanAccessCode": {
+              "title": "LAN Access Code",
+              "type": "string",
+              "required": true,
+              "description": "Settings (cog icon) > General on the printer's touchscreen, shown in green."
+            },
+            "mqttPort": {
+              "title": "MQTT Port",
+              "type": "number",
+              "default": 8883
+            },
+            "mqttUsername": {
+              "title": "MQTT Username",
+              "type": "string",
+              "default": "bblp"
+            },
+            "rejectUnauthorized": {
+              "title": "Verify TLS Certificate",
+              "type": "boolean",
+              "default": false,
+              "description": "Bambu printers use a self-signed certificate, so this should normally stay off."
+            },
+            "refreshIntervalSeconds": {
+              "title": "Full State Refresh Interval (seconds)",
+              "type": "number",
+              "default": 60
+            },
+            "reconnectDelaySeconds": {
+              "title": "Reconnect Delay (seconds)",
+              "type": "number",
+              "default": 10
+            },
+            "activeStates": {
+              "title": "gcode_state values treated as \"occupied\"",
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "default": ["RUNNING", "PREPARE", "PAUSE", "SLICING"]
+            },
+            "filamentRunoutErrorCodes": {
+              "title": "print_error codes treated as \"filament run-out\"",
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "default": ["0300_8015", "0300_8004", "0700_8011", "0701_8011", "0702_8011", "0703_8011", "1200_8011", "1201_8011", "1202_8011", "1203_8011", "12FF_8011", "07FF_8011"],
+              "description": "Pre-filled from a community code mapping covering the external-spool and each AMS-slot run-out variant. Add more if the Homebridge log shows an unmatched pause code on a real run-out."
+            },
+            "pingieGroupId": {
+              "title": "Pingie Notify! Group ID",
+              "type": "string",
+              "description": "Starts with GRP. Leave both Pingie fields blank to disable notifications."
+            },
+            "pingieGroupToken": {
+              "title": "Pingie Notify! Group Token",
+              "type": "string"
+            },
+            "pingieIconUrl": {
+              "title": "Pingie Notification Icon URL (optional)",
+              "type": "string",
+              "description": "Small circular sender icon shown next to the title."
+            },
+            "pingieImageUrl": {
+              "title": "Pingie Notification Image URL (optional)",
+              "type": "string",
+              "description": "Larger hero image shown when the notification is expanded. JPEG/PNG/GIF, under 10MB, must be HTTPS."
+            },
+            "averagePrintWattage": {
+              "title": "Average Print Power Draw (W)",
+              "type": "number",
+              "description": "Used only for cost estimates. Leave blank to get duration-only notifications."
+            },
+            "electricityRatePencePerKwh": {
+              "title": "Electricity Rate (pence/kWh)",
+              "type": "number",
+              "description": "Used only for cost estimates. Leave blank to get duration-only notifications."
+            }
+          }
+        }
+      }
+    }
+  }
+}
