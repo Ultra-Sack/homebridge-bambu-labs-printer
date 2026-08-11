@@ -53,6 +53,7 @@ to tell apart at a glance:
 | Notification | Title |
 |---|---|
 | Print started | 🖨️ Print started |
+| Print progress | 🖨️ Print progress (every 5%, configurable) |
 | Print finished | ✅ Print finished |
 | Printer fault | 🚨 Printer fault |
 | Filament run-out | 🧵⚠️ Filament run-out |
@@ -181,6 +182,30 @@ Bambu Lab documentation, and it has known gaps** - some codes genuinely aren't
 in it yet (see [this open issue](https://github.com/greghesp/ha-bambulab/issues/525)
 for an example). When a code isn't found, the notification falls back to the
 raw numeric code instead of guessing.
+
+## Live camera snapshots in notifications
+
+Setting `includeCameraSnapshot: true` attaches a current frame from the printer's
+camera to every notification. Since Pingie's servers fetch the image URL
+themselves (not your phone), it has to be reachable from the public internet -
+this works by grabbing a frame via `ffmpeg` and uploading it to a **public**
+GitHub repo via the Contents API, overwriting one fixed file (`githubSnapshotPath`)
+each time, then linking to it via `raw.githubusercontent.com` with a timestamp
+query param so the CDN doesn't serve a stale cached copy.
+
+Requirements:
+- `ffmpeg` available on the Homebridge host (set `ffmpegPath` if it's not on PATH)
+- A **public** GitHub repo (private repos return 404/login to unauthenticated
+  fetchers like Pingie)
+- A GitHub **fine-grained** Personal Access Token scoped to only
+  "Contents: read and write" on that one repo - not a broad classic token,
+  since it lives in plugin config
+
+This adds a few seconds of latency to each notification while the frame is
+captured and uploaded, and each upload is a real commit to the repo, so its
+history will grow steadily over time. If capture or upload fails for any
+reason, the notification still sends as plain text - a missing snapshot never
+blocks the underlying alert.
 
 ## Filament run-out setup
 

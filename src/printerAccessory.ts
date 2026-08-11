@@ -1,5 +1,6 @@
 import { Service, PlatformAccessory } from 'homebridge';
 import * as mqtt from 'mqtt';
+import { spawn } from 'child_process';
 import { BambuPrintStatusPlatform } from './platform';
 import { BAMBU_ERROR_CODES, KNOWN_FILAMENT_RUNOUT_CODES } from './bambuErrorCodes';
 
@@ -32,6 +33,23 @@ export interface PrinterConfig {
   // duration-only notifications still work without them.
   averagePrintWattage?: number;
   electricityRatePencePerKwh?: number;
+
+  // Sends a Pingie push every N percent of progress (e.g. 5 -> notifications at
+  // 5%, 10%, 15%...), each with the printer's current estimated time remaining.
+  // Set to 0 to disable. Defaults to 5.
+  progressNotificationIntervalPercent?: number;
+
+  // Attaches a live camera snapshot to notifications. Requires ffmpeg on PATH
+  // (or ffmpegPath below) and a GitHub fine-grained PAT scoped to just
+  // "Contents: read and write" on githubRepo - the snapshot gets uploaded there
+  // (overwriting one fixed file each time) and referenced via its raw URL.
+  includeCameraSnapshot?: boolean;
+  ffmpegPath?: string;
+  githubToken?: string;
+  githubOwner?: string;
+  githubRepo?: string;
+  githubSnapshotPath?: string;
+  githubBranch?: string;
 }
 
 const DEFAULT_ACTIVE_STATES = ['RUNNING', 'PREPARE', 'PAUSE', 'SLICING'];
@@ -54,6 +72,7 @@ export class BambuPrinterAccessory {
   private printProgressPercent = 0;
   private printStartTimestamp?: number;
   private printEstimatedTotalMinutes?: number;
+  private lastNotifiedProgressBucket = -1;
 
   // Bambu printers send partial diffs after the first message, so we keep a
   // merged copy of everything we've seen rather than trusting any single message.
@@ -316,11 +335,137 @@ export class BambuPrinterAccessory {
     this.platform.log.info(`[${this.printerConfig.name}] Chamber light -> ${on ? 'ON' : 'OFF'}`);
   }
 
-  private async sendPingieNotification(title: string, text: string) {
+  // Captures a single JPEG frame from the printer's RTSPS stream via ffmpeg,
+  // piped directly to stdout (no temp file). Returns undefined on any failure -
+  // callers should treat a missing snapshot as non-fatal, never blocking the
+  // underlying text notification.
+  private async captureSnapshot(): Promise<Buffer | undefined> {
+    const ffmpegPath = this.printerConfig.ffmpegPath ?? 'ffmpeg';
+    const rtspUrl =
+      `rtsps://${this.printerConfig.mqttUsername ?? 'bblp'}:${this.printerConfig.lanAccessCode}` +
+      `@${this.printerConfig.ipAddress}:322/streaming/live/1`;
+
+    return new Promise((resolve) => {
+      const args = [
+        '-tls_verify', '0',
+        '-rtsp_transport', 'tcp',
+        '-i', rtspUrl,
+        '-frames:v', '1',
+        '-f', 'image2pipe',
+        '-vcodec', 'mjpeg',
+        'pipe:1',
+      ];
+      const proc = spawn(ffmpegPath, args);
+      const chunks: Buffer[] = [];
+      let settled = false;
+
+      const timeout = setTimeout(() => {
+        if (!settled) {
+          settled = true;
+          proc.kill('SIGKILL');
+          this.platform.log.warn(`[${this.printerConfig.name}] Snapshot capture timed out.`);
+          resolve(undefined);
+        }
+      }, 15_000);
+
+      proc.stdout.on('data', (chunk: Buffer) => chunks.push(chunk));
+      proc.on('error', (err) => {
+        if (!settled) {
+          settled = true;
+          clearTimeout(timeout);
+          this.platform.log.warn(`[${this.printerConfig.name}] Snapshot capture failed to start: ${err.message}`);
+          resolve(undefined);
+        }
+      });
+      proc.on('close', (code) => {
+        if (!settled) {
+          settled = true;
+          clearTimeout(timeout);
+          if (code === 0 && chunks.length > 0) {
+            resolve(Buffer.concat(chunks));
+          } else {
+            this.platform.log.warn(`[${this.printerConfig.name}] Snapshot capture exited with code ${code}.`);
+            resolve(undefined);
+          }
+        }
+      });
+    });
+  }
+
+  // Uploads a JPEG to GitHub via the Contents API, overwriting one fixed file
+  // each time rather than accumulating a new file per notification. Returns a
+  // raw.githubusercontent.com URL with a cache-busting timestamp, or undefined
+  // on any failure.
+  private async uploadSnapshotToGithub(jpeg: Buffer): Promise<string | undefined> {
+    const { githubToken, githubOwner, githubRepo } = this.printerConfig;
+    if (!githubToken || !githubOwner || !githubRepo) {
+      return undefined;
+    }
+    const path = this.printerConfig.githubSnapshotPath ?? 'images/latest-print.jpg';
+    const branch = this.printerConfig.githubBranch ?? 'main';
+    const apiUrl = `https://api.github.com/repos/${githubOwner}/${githubRepo}/contents/${path}`;
+    const headers = {
+      Authorization: `Bearer ${githubToken}`,
+      Accept: 'application/vnd.github+json',
+      'User-Agent': 'homebridge-bambu-print-status',
+    };
+
+    try {
+      // Fetch the current file's sha if it exists - required by the Contents
+      // API to overwrite rather than create a duplicate/conflict.
+      let sha: string | undefined;
+      const existing = await fetch(`${apiUrl}?ref=${encodeURIComponent(branch)}`, { headers });
+      if (existing.ok) {
+        const body = (await existing.json()) as { sha?: string };
+        sha = body.sha;
+      }
+
+      const putRes = await fetch(apiUrl, {
+        method: 'PUT',
+        headers: { ...headers, 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          message: `Update print snapshot (${new Date().toISOString()})`,
+          content: jpeg.toString('base64'),
+          branch,
+          ...(sha ? { sha } : {}),
+        }),
+      });
+
+      if (!putRes.ok) {
+        const errBody = await putRes.text().catch(() => '');
+        this.platform.log.warn(
+          `[${this.printerConfig.name}] GitHub snapshot upload failed (${putRes.status}): ${errBody}`,
+        );
+        return undefined;
+      }
+
+      return `https://raw.githubusercontent.com/${githubOwner}/${githubRepo}/${branch}/${path}?t=${Date.now()}`;
+    } catch (err) {
+      this.platform.log.warn(
+        `[${this.printerConfig.name}] GitHub snapshot upload error: ${(err as Error).message}`,
+      );
+      return undefined;
+    }
+  }
+
+  // Wraps sendPingieNotification with an optional live snapshot attached.
+  // Falls back to a plain text-only notification if capture/upload fails or
+  // includeCameraSnapshot isn't enabled - never blocks the underlying alert.
+  private async sendPingieNotificationWithSnapshot(title: string, text: string) {
+    if (!this.printerConfig.includeCameraSnapshot) {
+      return this.sendPingieNotification(title, text);
+    }
+    const jpeg = await this.captureSnapshot();
+    const snapshotUrl = jpeg ? await this.uploadSnapshotToGithub(jpeg) : undefined;
+    return this.sendPingieNotification(title, text, snapshotUrl);
+  }
+
+  private async sendPingieNotification(title: string, text: string, overrideImageUrl?: string) {
     const { pingieGroupId, pingieGroupToken, pingieIconUrl, pingieImageUrl } = this.printerConfig;
     if (!pingieGroupId || !pingieGroupToken) {
       return; // notifications not configured - silently skip
     }
+    const imageUrl = overrideImageUrl ?? pingieImageUrl;
     try {
       const url =
         `https://notifypush.pingie.com/notify-json/${encodeURIComponent(pingieGroupId)}` +
@@ -333,7 +478,7 @@ export class BambuPrinterAccessory {
           title,
           groupType: 'bambu-print-status',
           ...(pingieIconUrl ? { iconUrl: pingieIconUrl } : {}),
-          ...(pingieImageUrl ? { imageUrl: pingieImageUrl } : {}),
+          ...(imageUrl ? { imageUrl } : {}),
         }),
       });
       if (!res.ok) {
@@ -513,7 +658,7 @@ export class BambuPrinterAccessory {
           ? `${this.printerConfig.name}: ${description}${codeSuffix}`
           : `${this.printerConfig.name} reported a fault (print_error=${printError ?? 'unknown'}, ` +
             `${hms?.length ?? 0} active HMS entries). Check the printer.`;
-        void this.sendPingieNotification('🚨 Printer fault', body);
+        void this.sendPingieNotificationWithSnapshot('🚨 Printer fault', body);
       }
     }
 
@@ -534,7 +679,7 @@ export class BambuPrinterAccessory {
       );
       if (filamentNow) {
         const description = printError ? this.describeError(printError) : undefined;
-        void this.sendPingieNotification(
+        void this.sendPingieNotificationWithSnapshot(
           '🧵⚠️ Filament run-out',
           description
             ? `${this.printerConfig.name}: ${description}`
@@ -557,6 +702,7 @@ export class BambuPrinterAccessory {
     // Print-started notification - only a real start, not a resume from PAUSE.
     if (gcodeState === 'RUNNING' && this.previousGcodeState !== 'RUNNING' && this.previousGcodeState !== 'PAUSE') {
       this.printStartTimestamp = Date.now();
+      this.lastNotifiedProgressBucket = -1;
       const remaining = this.mergedState.mc_remaining_time as number | undefined;
       this.printEstimatedTotalMinutes = typeof remaining === 'number' && remaining > 0 ? remaining : undefined;
 
@@ -581,7 +727,7 @@ export class BambuPrinterAccessory {
       } else {
         parts.push("No time estimate available yet from the printer - check again once it's underway.");
       }
-      void this.sendPingieNotification('🖨️ Print started', parts.join(' '));
+      void this.sendPingieNotificationWithSnapshot('🖨️ Print started', parts.join(' '));
     }
 
     // Print-finished notification - fire once on the transition into FINISH,
@@ -608,7 +754,7 @@ export class BambuPrinterAccessory {
           parts.push(`Estimated cost: £${cost.toFixed(2)}.`);
         }
       }
-      void this.sendPingieNotification('✅ Print finished', parts.join(' '));
+      void this.sendPingieNotificationWithSnapshot('✅ Print finished', parts.join(' '));
 
       this.printStartTimestamp = undefined;
       this.printEstimatedTotalMinutes = undefined;
@@ -646,6 +792,23 @@ export class BambuPrinterAccessory {
           this.platform.Characteristic.RotationSpeed,
           clamped,
         );
+      }
+
+      const interval = this.printerConfig.progressNotificationIntervalPercent ?? 5;
+      if (interval > 0 && occupied) {
+        const bucket = Math.floor(clamped / interval) * interval;
+        if (bucket > this.lastNotifiedProgressBucket && bucket > 0) {
+          this.lastNotifiedProgressBucket = bucket;
+          const remaining = this.mergedState.mc_remaining_time as number | undefined;
+          const remainingText =
+            typeof remaining === 'number' && remaining >= 0
+              ? `${this.formatDuration(remaining)} remaining`
+              : 'time remaining not available yet';
+          void this.sendPingieNotificationWithSnapshot(
+            '🖨️ Print progress',
+            `${this.printerConfig.name}: ${bucket}% complete - ${remainingText}.`,
+          );
+        }
       }
     }
   }

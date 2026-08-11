@@ -112,6 +112,49 @@
               "title": "Electricity Rate (pence/kWh)",
               "type": "number",
               "description": "Used only for cost estimates. Leave blank to get duration-only notifications."
+            },
+            "progressNotificationIntervalPercent": {
+              "title": "Progress Notification Interval (%)",
+              "type": "number",
+              "default": 5,
+              "description": "Sends a notification every N percent complete, with time remaining. Set to 0 to disable."
+            },
+            "includeCameraSnapshot": {
+              "title": "Include a live camera snapshot in notifications",
+              "type": "boolean",
+              "default": false,
+              "description": "Requires ffmpeg and the GitHub fields below. Adds a few seconds of latency per notification while the snapshot is captured and uploaded."
+            },
+            "ffmpegPath": {
+              "title": "ffmpeg Path",
+              "type": "string",
+              "default": "ffmpeg",
+              "description": "Only needed if ffmpeg isn't on your system PATH."
+            },
+            "githubToken": {
+              "title": "GitHub Personal Access Token",
+              "type": "string",
+              "description": "Fine-grained PAT scoped to only \"Contents: read and write\" on the repo below - not a broad classic token."
+            },
+            "githubOwner": {
+              "title": "GitHub Username/Org",
+              "type": "string"
+            },
+            "githubRepo": {
+              "title": "GitHub Repo",
+              "type": "string",
+              "description": "Must be public so raw.githubusercontent.com URLs work without auth."
+            },
+            "githubSnapshotPath": {
+              "title": "Snapshot File Path in Repo",
+              "type": "string",
+              "default": "images/latest-print.jpg",
+              "description": "This one file gets overwritten each time, rather than accumulating a new file per notification."
+            },
+            "githubBranch": {
+              "title": "GitHub Branch",
+              "type": "string",
+              "default": "main"
             }
           }
         }
