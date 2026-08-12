@@ -122,6 +122,28 @@ export class BambuPrinterAccessory {
         ? printerConfig.activeStates
         : DEFAULT_ACTIVE_STATES;
 
+    // One-time cleanup: earlier plugin versions created some services
+    // (Fanv2, ContactSensor, StatelessProgrammableSwitch) without explicit
+    // subtypes, before this version needed them to distinguish multiple
+    // services of the same type on one accessory (e.g. Progress vs Speed
+    // fans). Homebridge identifies cached services by subtype, so adding a
+    // subtype to a previously-subtype-less service abandons the old one
+    // rather than renaming it - this removes those orphaned leftovers so
+    // upgrading doesn't leave duplicate/dead tiles behind in the Home app.
+    const typesToDeduplicate = [
+      this.platform.Service.Fanv2.UUID,
+      this.platform.Service.ContactSensor.UUID,
+      this.platform.Service.StatelessProgrammableSwitch.UUID,
+    ];
+    for (const existing of [...this.accessory.services]) {
+      if (typesToDeduplicate.includes(existing.UUID) && !existing.subtype) {
+        this.platform.log.info(
+          `[${printerConfig.name}] Removing orphaned pre-upgrade service: ${existing.displayName}`,
+        );
+        this.accessory.removeService(existing);
+      }
+    }
+
     const infoService = this.accessory.getService(this.platform.Service.AccessoryInformation);
     if (infoService) {
       infoService
