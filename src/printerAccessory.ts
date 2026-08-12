@@ -1,5 +1,9 @@
 import { Service, PlatformAccessory } from 'homebridge';
 import * as mqtt from 'mqtt';
+import { Client as FtpClient } from 'basic-ftp';
+import { Writable } from 'stream';
+import AdmZip from 'adm-zip';
+import { XMLParser } from 'fast-xml-parser';
 import { BambuPrintStatusPlatform } from './platform';
 import { BAMBU_ERROR_CODES, KNOWN_FILAMENT_RUNOUT_CODES } from './bambuErrorCodes';
 
@@ -38,6 +42,12 @@ export interface PrinterConfig {
   // Set to 0 to disable. Defaults to 5.
   progressNotificationIntervalPercent?: number;
 
+  // Delays the "Print started" Pingie push (not the HomeKit switch, which
+  // still fires instantly) by this many seconds, giving mc_remaining_time a
+  // chance to populate with this print's real estimate rather than showing
+  // "no estimate yet" or a stale value left over from a previous print.
+  startNotificationDelaySeconds?: number;
+
   // Attaches a live camera snapshot (as the notification icon, shown immediately
   // rather than only on tap) pulled from camera.ui's own REST API - reuses the
   // connection camera.ui already holds rather than opening a second one to the
@@ -53,6 +63,13 @@ export interface PrinterConfig {
   githubRepo?: string;
   githubSnapshotPath?: string;
   githubBranch?: string;
+
+  // Price per kg by material type (e.g. {"PLA": 18.99, "PETG": 22.99}), used
+  // to cost out the filament actually used in a finished print, read from the
+  // sliced 3MF file's own metadata via FTP rather than AMS remaining-%
+  // tracking (which only works for genuine Bambu RFID spools). A material not
+  // in this map still shows its weight, just without a cost figure.
+  filamentPricesPerKg?: Record<string, number>;
 }
 
 const DEFAULT_ACTIVE_STATES = ['RUNNING', 'PREPARE', 'PAUSE', 'SLICING'];
@@ -61,6 +78,7 @@ export class BambuPrinterAccessory {
   private readonly service: Service;
   private readonly lightService: Service;
   private readonly progressService: Service;
+  private readonly speedService: Service;
   private readonly pauseService: Service;
   private readonly startedSwitchService: Service;
   private readonly finishedSwitchService: Service;
@@ -73,11 +91,17 @@ export class BambuPrinterAccessory {
   private filamentOut = false;
   private previousGcodeState?: string;
   private printProgressPercent = 0;
+  // 1=Silent, 2=Standard, 3=Sport, 4=Ludicrous. Tracked optimistically from
+  // our own commands; also reconciled against the printer's own spd_lvl
+  // field when present in the report (moderate, not fully verified confidence
+  // in that exact field name - falls back to optimistic tracking if absent).
+  private currentSpeedLevel = 2;
   private printStartTimestamp?: number;
   private printEstimatedTotalMinutes?: number;
   private lastNotifiedProgressBucket = -1;
   private cameraUiToken?: string;
   private cameraUiTokenExpiresAt = 0;
+  private startNotificationTimer?: ReturnType<typeof setTimeout>;
 
   // Bambu printers send partial diffs after the first message, so we keep a
   // merged copy of everything we've seen rather than trusting any single message.
@@ -150,8 +174,8 @@ export class BambuPrinterAccessory {
     // estimate. Active/RotationSpeed are read-only display - any attempt to
     // change them from the Home app just snaps back to the real value.
     this.progressService =
-      this.accessory.getService(this.platform.Service.Fanv2) ||
-      this.accessory.addService(this.platform.Service.Fanv2, `${printerConfig.name} Progress`);
+      this.accessory.getServiceById(this.platform.Service.Fanv2, 'progress') ||
+      this.accessory.addService(this.platform.Service.Fanv2, `${printerConfig.name} Progress`, 'progress');
     this.progressService.setCharacteristic(
       this.platform.Characteristic.Name,
       `${printerConfig.name} Progress`,
@@ -191,6 +215,40 @@ export class BambuPrinterAccessory {
           0,
         );
       });
+
+    // Print speed profile - HomeKit has no native 4-way selector, so this
+    // reuses the same Fan-slider trick as Progress, snapped to exactly 4
+    // positions: 25%=Silent, 50%=Standard, 75%=Sport, 100%=Ludicrous. Real
+    // limitation: the Home app only shows a percentage, not the profile name
+    // - there's no way to label slider positions in stock Home app.
+    this.speedService =
+      this.accessory.getServiceById(this.platform.Service.Fanv2, 'speed') ||
+      this.accessory.addService(this.platform.Service.Fanv2, `${printerConfig.name} Speed`, 'speed');
+    this.speedService.setCharacteristic(this.platform.Characteristic.Name, `${printerConfig.name} Speed`);
+    this.speedService
+      .getCharacteristic(this.platform.Characteristic.Active)
+      .onGet(() =>
+        this.currentlyOccupied
+          ? this.platform.Characteristic.Active.ACTIVE
+          : this.platform.Characteristic.Active.INACTIVE,
+      )
+      .onSet(() => {
+        setTimeout(
+          () =>
+            this.speedService.updateCharacteristic(
+              this.platform.Characteristic.Active,
+              this.currentlyOccupied
+                ? this.platform.Characteristic.Active.ACTIVE
+                : this.platform.Characteristic.Active.INACTIVE,
+            ),
+          0,
+        );
+      });
+    this.speedService
+      .getCharacteristic(this.platform.Characteristic.RotationSpeed)
+      .setProps({ minValue: 25, maxValue: 100, minStep: 25 })
+      .onGet(() => this.currentSpeedLevel * 25)
+      .onSet((value) => this.setPrintSpeed(Math.round((value as number) / 25)));
 
     // Pause/Resume - a genuine two-state Switch (unlike Stop, this is safely
     // reversible): On while the printer is paused, Off while running. Reflects
@@ -298,6 +356,39 @@ export class BambuPrinterAccessory {
     return desc && desc.length > 0 ? desc : undefined;
   }
 
+  // Sends the print_speed MQTT command. There's a documented firmware bug
+  // (confirmed on P1 series, plausibly others) where sending "param" as
+  // anything other than a proper JSON string "1"-"4" causes a type-confusion
+  // bug producing a garbage speed multiplier (one user saw 510%) - so this
+  // only ever accepts the four valid levels and always forces param through
+  // String() explicitly, never a bare number.
+  private setPrintSpeed(level: number) {
+    if (![1, 2, 3, 4].includes(level)) {
+      this.platform.log.warn(`[${this.printerConfig.name}] Ignoring invalid print speed level: ${level}`);
+      setTimeout(
+        () => this.speedService.updateCharacteristic(this.platform.Characteristic.RotationSpeed, this.currentSpeedLevel * 25),
+        0,
+      );
+      return;
+    }
+    if (!this.client || !this.client.connected) {
+      this.platform.log.warn(`[${this.printerConfig.name}] Can't set print speed - not connected.`);
+      setTimeout(
+        () => this.speedService.updateCharacteristic(this.platform.Characteristic.RotationSpeed, this.currentSpeedLevel * 25),
+        0,
+      );
+      return;
+    }
+
+    const payload = JSON.stringify({
+      print: { sequence_id: '0', command: 'print_speed', param: String(level) },
+    });
+    this.client.publish(`device/${this.printerConfig.serialNumber}/request`, payload);
+    this.currentSpeedLevel = level; // optimistic; reconciled against spd_lvl if/when it arrives
+    const names = ['', 'Silent', 'Standard', 'Sport', 'Ludicrous'];
+    this.platform.log.info(`[${this.printerConfig.name}] Print speed -> ${names[level]}`);
+  }
+
   private setPauseState(pause: boolean) {
     if (!this.client || !this.client.connected) {
       this.platform.log.warn(`[${this.printerConfig.name}] Can't ${pause ? 'pause' : 'resume'} - not connected.`);
@@ -380,6 +471,150 @@ export class BambuPrinterAccessory {
   // Pulls a snapshot from camera.ui's own cached camera feed rather than
   // opening a second connection to the printer directly. Retries once with a
   // fresh login if the cached token turns out to be stale (401).
+  // Fetches the current print's sliced .3mf project file over FTPS and parses
+  // its embedded slicer metadata to get per-material filament weight - this
+  // works for ANY filament (genuine or third-party), unlike AMS remaining-%
+  // tracking which only works for genuine Bambu RFID spools. The exact 3MF
+  // internal path and XML attribute names aren't independently verified here,
+  // so on any mismatch this logs the raw content it found rather than
+  // guessing - check the log and adjust if your Studio version differs.
+  private async fetchFilamentUsage(): Promise<{ type: string; grams: number }[] | undefined> {
+    const subtaskNameRaw = this.mergedState.subtask_name as string | undefined;
+    if (!subtaskNameRaw) {
+      this.platform.log.warn(`[${this.printerConfig.name}] No subtask_name available - can't locate the project file.`);
+      return undefined;
+    }
+    const subtaskName = subtaskNameRaw.toLowerCase().endsWith('.3mf') ? subtaskNameRaw : `${subtaskNameRaw}.3mf`;
+    const candidatePaths = [`/cache/${subtaskName}`, `/${subtaskName}`];
+
+    const client = new FtpClient();
+    client.ftp.verbose = false;
+    let fileBuffer: Buffer | undefined;
+    let usedPath: string | undefined;
+
+    try {
+      await client.access({
+        host: this.printerConfig.ipAddress,
+        port: 990,
+        user: this.printerConfig.mqttUsername ?? 'bblp',
+        password: this.printerConfig.lanAccessCode,
+        secure: 'implicit',
+        secureOptions: { rejectUnauthorized: false },
+      });
+
+      for (const path of candidatePaths) {
+        try {
+          const chunks: Buffer[] = [];
+          const sink = new Writable({
+            write(chunk, _enc, cb) {
+              chunks.push(chunk);
+              cb();
+            },
+          });
+          await client.downloadTo(sink, path);
+          fileBuffer = Buffer.concat(chunks);
+          usedPath = path;
+          break;
+        } catch {
+          // try the next candidate path
+        }
+      }
+    } catch (err) {
+      this.platform.log.warn(`[${this.printerConfig.name}] FTP connection failed: ${(err as Error).message}`);
+      return undefined;
+    } finally {
+      client.close();
+    }
+
+    if (!fileBuffer || !usedPath) {
+      this.platform.log.warn(
+        `[${this.printerConfig.name}] Couldn't find the project file at any of: ${candidatePaths.join(', ')}`,
+      );
+      return undefined;
+    }
+    this.platform.log.info(`[${this.printerConfig.name}] Fetched project file from ${usedPath}`);
+
+    try {
+      const zip = new AdmZip(fileBuffer);
+      const entry =
+        zip.getEntry('Metadata/slice_info.config') ??
+        zip.getEntries().find((e) => e.entryName.toLowerCase().endsWith('slice_info.config'));
+      if (!entry) {
+        this.platform.log.warn(
+          `[${this.printerConfig.name}] No slice_info.config found in the 3MF. Entries: ` +
+            zip.getEntries().map((e) => e.entryName).join(', '),
+        );
+        return undefined;
+      }
+
+      const xml = entry.getData().toString('utf-8');
+      const parser = new XMLParser({ ignoreAttributes: false, attributeNamePrefix: '@_' });
+      const parsed = parser.parse(xml);
+
+      const plate = parsed?.config?.plate;
+      const rawFilaments = plate?.filament;
+      const filamentList = Array.isArray(rawFilaments) ? rawFilaments : rawFilaments ? [rawFilaments] : [];
+
+      if (filamentList.length === 0) {
+        this.platform.log.warn(
+          `[${this.printerConfig.name}] No <filament> entries found in slice_info.config. Raw content: ${xml.slice(0, 500)}`,
+        );
+        return undefined;
+      }
+
+      const results: { type: string; grams: number }[] = [];
+      for (const f of filamentList) {
+        const type = f['@_type'] as string | undefined;
+        const gramsRaw = f['@_used_g'] ?? f['@_usedG'] ?? f['@_weight'];
+        const grams = gramsRaw !== undefined ? parseFloat(gramsRaw) : NaN;
+        if (!type || Number.isNaN(grams)) {
+          this.platform.log.warn(
+            `[${this.printerConfig.name}] Couldn't read type/weight from a filament entry - raw: ${JSON.stringify(f)}`,
+          );
+          continue;
+        }
+        results.push({ type, grams });
+      }
+
+      return results.length > 0 ? results : undefined;
+    } catch (err) {
+      this.platform.log.warn(
+        `[${this.printerConfig.name}] Failed to parse the 3MF project file: ${(err as Error).message}`,
+      );
+      return undefined;
+    }
+  }
+
+  // Combines same-material entries and prices them via filamentPricesPerKg.
+  // A material with no configured price still reports its weight, just with
+  // cost: undefined, and is excluded from the total rather than silently
+  // treated as free.
+  private estimateFilamentCost(
+    entries: { type: string; grams: number }[],
+  ): { totalCost: number; anyUnpriced: boolean; byMaterial: { type: string; grams: number; cost?: number }[] } {
+    const prices = this.printerConfig.filamentPricesPerKg ?? {};
+    const byType = new Map<string, number>();
+    for (const e of entries) {
+      byType.set(e.type, (byType.get(e.type) ?? 0) + e.grams);
+    }
+
+    let totalCost = 0;
+    let anyUnpriced = false;
+    const byMaterial: { type: string; grams: number; cost?: number }[] = [];
+    for (const [type, grams] of byType) {
+      const pricePerKg = prices[type];
+      const cost = pricePerKg !== undefined ? (grams / 1000) * pricePerKg : undefined;
+      if (cost !== undefined) {
+        totalCost += cost;
+      } else {
+        anyUnpriced = true;
+      }
+      byMaterial.push({ type, grams, cost });
+    }
+
+    return { totalCost, anyUnpriced, byMaterial };
+  }
+
   private async captureSnapshotFromCameraUi(): Promise<Buffer | undefined> {
     const { cameraUiBaseUrl, cameraUiCameraName } = this.printerConfig;
     if (!cameraUiBaseUrl || !cameraUiCameraName) {
@@ -483,6 +718,54 @@ export class BambuPrinterAccessory {
     const jpeg = await this.captureSnapshotFromCameraUi();
     const snapshotUrl = jpeg ? await this.uploadSnapshotToGithub(jpeg) : undefined;
     return this.sendPingieNotification(title, text, snapshotUrl);
+  }
+
+  // Sends the three finish-time notifications in order: combined total,
+  // filament breakdown, then electricity alone. Filament data comes from an
+  // FTP fetch that takes a few seconds, so this runs as its own async flow
+  // rather than blocking the MQTT message handler.
+  private async sendFinishedNotifications(elapsedMinutes: number | undefined) {
+    const electricityCost = elapsedMinutes !== undefined ? this.estimateCost(elapsedMinutes) : undefined;
+
+    const filamentUsage = await this.fetchFilamentUsage();
+    const filamentInfo = filamentUsage ? this.estimateFilamentCost(filamentUsage) : undefined;
+
+    // 1. Combined total.
+    const jobName = this.mergedState.subtask_name as string | undefined;
+    const combinedParts = jobName
+      ? [`Print finished on ${this.printerConfig.name}: "${jobName}".`]
+      : [`Print finished on ${this.printerConfig.name}.`];
+    if (elapsedMinutes !== undefined) {
+      combinedParts.push(`Took ${this.formatDuration(elapsedMinutes)}.`);
+    }
+    const combinedTotal = (filamentInfo?.totalCost ?? 0) + (electricityCost ?? 0);
+    if (filamentInfo || electricityCost !== undefined) {
+      combinedParts.push(`Total cost: £${combinedTotal.toFixed(2)}` + (filamentInfo?.anyUnpriced ? ' (some materials unpriced)' : '') + '.');
+    }
+    await this.sendPingieNotificationWithSnapshot('✅ Print finished', combinedParts.join(' '));
+
+    // 2. Filament breakdown, per material - only sent if we actually got data.
+    if (filamentInfo && filamentInfo.byMaterial.length > 0) {
+      const lines = filamentInfo.byMaterial.map((m) => {
+        const costText = m.cost !== undefined ? `£${m.cost.toFixed(2)}` : 'price not set';
+        return `${m.type}: ${m.grams.toFixed(1)}g (${costText})`;
+      });
+      const filamentTotalText = `Total filament: £${filamentInfo.totalCost.toFixed(2)}` +
+        (filamentInfo.anyUnpriced ? ' (excludes unpriced materials).' : '.');
+      await this.sendPingieNotificationWithSnapshot(
+        '🧵 Filament cost',
+        `${this.printerConfig.name}: ${lines.join(', ')}. ${filamentTotalText}`,
+      );
+    }
+
+    // 3. Electricity alone.
+    if (electricityCost !== undefined) {
+      await this.sendPingieNotificationWithSnapshot(
+        '⚡ Electricity cost',
+        `${this.printerConfig.name}: ${elapsedMinutes ? this.formatDuration(elapsedMinutes) + ', ' : ''}` +
+          `estimated £${electricityCost.toFixed(2)}.`,
+      );
+    }
   }
 
   private async sendPingieNotification(title: string, text: string, overrideIconUrl?: string) {
@@ -728,31 +1011,45 @@ export class BambuPrinterAccessory {
     if (gcodeState === 'RUNNING' && this.previousGcodeState !== 'RUNNING' && this.previousGcodeState !== 'PAUSE') {
       this.printStartTimestamp = Date.now();
       this.lastNotifiedProgressBucket = -1;
-      const remaining = this.mergedState.mc_remaining_time as number | undefined;
-      this.printEstimatedTotalMinutes = typeof remaining === 'number' && remaining > 0 ? remaining : undefined;
+      // Clear any stale estimate left over from a previous print so the delayed
+      // notification below can't accidentally use last print's number.
+      delete this.mergedState.mc_remaining_time;
+      this.printEstimatedTotalMinutes = undefined;
 
-      this.platform.log.info(
-        `[${this.printerConfig.name}] Print started` +
-          (this.printEstimatedTotalMinutes
-            ? ` - estimated ${this.formatDuration(this.printEstimatedTotalMinutes)}`
-            : ' - no time estimate yet'),
-      );
+      this.platform.log.info(`[${this.printerConfig.name}] Print started.`);
       this.startedSwitchService.updateCharacteristic(
         this.platform.Characteristic.ProgrammableSwitchEvent,
         this.platform.Characteristic.ProgrammableSwitchEvent.SINGLE_PRESS,
       );
 
-      const parts = [`Print started on ${this.printerConfig.name}.`];
-      if (this.printEstimatedTotalMinutes) {
-        parts.push(`Estimated time: ${this.formatDuration(this.printEstimatedTotalMinutes)}.`);
-        const cost = this.estimateCost(this.printEstimatedTotalMinutes);
-        if (cost !== undefined) {
-          parts.push(`Estimated cost: £${cost.toFixed(2)}.`);
-        }
-      } else {
-        parts.push("No time estimate available yet from the printer - check again once it's underway.");
+      // Delay the Pingie push (not the HomeKit switch above, which fires
+      // instantly) so mc_remaining_time has a real chance to populate with
+      // this print's own estimate first, rather than reporting "no estimate
+      // yet" immediately.
+      if (this.startNotificationTimer) {
+        clearTimeout(this.startNotificationTimer);
       }
-      void this.sendPingieNotificationWithSnapshot('🖨️ Print started', parts.join(' '));
+      const delaySeconds = this.printerConfig.startNotificationDelaySeconds ?? 30;
+      this.startNotificationTimer = setTimeout(() => {
+        this.startNotificationTimer = undefined;
+        const remaining = this.mergedState.mc_remaining_time as number | undefined;
+        this.printEstimatedTotalMinutes = typeof remaining === 'number' && remaining > 0 ? remaining : undefined;
+        const jobName = this.mergedState.subtask_name as string | undefined;
+
+        const parts = jobName
+          ? [`Print started on ${this.printerConfig.name}: "${jobName}".`]
+          : [`Print started on ${this.printerConfig.name}.`];
+        if (this.printEstimatedTotalMinutes) {
+          parts.push(`Estimated time: ${this.formatDuration(this.printEstimatedTotalMinutes)}.`);
+          const cost = this.estimateCost(this.printEstimatedTotalMinutes);
+          if (cost !== undefined) {
+            parts.push(`Estimated cost: £${cost.toFixed(2)}.`);
+          }
+        } else {
+          parts.push("No time estimate available from the printer yet - check the app for progress.");
+        }
+        void this.sendPingieNotificationWithSnapshot('🖨️ Print started', parts.join(' '));
+      }, delaySeconds * 1000);
     }
 
     // Print-finished notification - fire once on the transition into FINISH,
@@ -771,15 +1068,7 @@ export class BambuPrinterAccessory {
         this.platform.Characteristic.ProgrammableSwitchEvent.SINGLE_PRESS,
       );
 
-      const parts = [`Print finished on ${this.printerConfig.name}.`];
-      if (elapsedMinutes !== undefined) {
-        parts.push(`Took ${this.formatDuration(elapsedMinutes)}.`);
-        const cost = this.estimateCost(elapsedMinutes);
-        if (cost !== undefined) {
-          parts.push(`Estimated cost: £${cost.toFixed(2)}.`);
-        }
-      }
-      void this.sendPingieNotificationWithSnapshot('✅ Print finished', parts.join(' '));
+      void this.sendFinishedNotifications(elapsedMinutes);
 
       this.printStartTimestamp = undefined;
       this.printEstimatedTotalMinutes = undefined;
@@ -806,6 +1095,16 @@ export class BambuPrinterAccessory {
           ? this.platform.Characteristic.Active.ACTIVE
           : this.platform.Characteristic.Active.INACTIVE,
       );
+    }
+
+    // Reconcile speed level against the printer's own report if it's present
+    // (moderate confidence in this exact field name, not independently
+    // verified - if it never fires, the control still works fine off our own
+    // optimistic tracking, it just won't self-correct from external changes).
+    const spdLvl = this.mergedState.spd_lvl as number | undefined;
+    if (typeof spdLvl === 'number' && [1, 2, 3, 4].includes(spdLvl) && spdLvl !== this.currentSpeedLevel) {
+      this.currentSpeedLevel = spdLvl;
+      this.speedService.updateCharacteristic(this.platform.Characteristic.RotationSpeed, spdLvl * 25);
     }
 
     const mcPercent = this.mergedState.mc_percent as number | undefined;
@@ -841,6 +1140,9 @@ export class BambuPrinterAccessory {
   public shutdown() {
     if (this.reconnectTimer) {
       clearTimeout(this.reconnectTimer);
+    }
+    if (this.startNotificationTimer) {
+      clearTimeout(this.startNotificationTimer);
     }
     this.stopRefreshTimer();
     this.client?.end(true);

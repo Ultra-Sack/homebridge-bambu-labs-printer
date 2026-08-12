@@ -18,6 +18,15 @@ Exposes a Bambu Lab printer to HomeKit as:
   read straight from the printer's own `mc_percent` field rather than estimated
   from time. It's read-only: dragging the slider or toggling it in the Home app
   just snaps back to the real value.
+- A **Fan ("Speed")** — snapped to exactly 4 positions (25/50/75/100%), mapped
+  to Bambu's Silent/Standard/Sport/Ludicrous speed profiles. Sends the
+  `print_speed` MQTT command with the level as a JSON string (`"1"`-`"4"`) -
+  deliberately never a bare number, since there's a documented firmware bug
+  (confirmed on P1 series, plausibly others) where sending the wrong type
+  causes a garbage speed multiplier. **Real limitation:** the Home app only
+  shows a percentage on the slider, not the profile name - there's no way to
+  label slider positions in stock Home app. 25%=Silent, 50%=Standard,
+  75%=Sport, 100%=Ludicrous.
 - A **Programmable Switch ("Started")** — fires a single press when a print begins
   (a genuine start, not a resume from pause), and sends a Pingie push with the
   estimated duration and (if configured) estimated electricity cost.
@@ -210,6 +219,46 @@ The plugin logs into camera.ui once, caches the JWT until shortly before it
 expires, and re-logs-in automatically - no manual token refresh needed. If
 capture or upload fails for any reason, the notification still sends as plain
 text; a missing snapshot never blocks the underlying alert.
+
+## Filament cost from the sliced 3MF file
+
+When a print finishes, the plugin fetches the current project's sliced `.3mf`
+file over FTPS (reusing the same LAN access code as MQTT/RTSP, port 990,
+implicit FTPS), reads the slicer's own embedded filament-weight metadata, and
+sends **three** notifications in this order:
+
+1. **✅ Print finished** - elapsed time + combined total cost (filament + electricity)
+2. **🧵 Filament cost** - per-material weight and cost breakdown, only sent if the
+   fetch/parse succeeded
+3. **⚡ Electricity cost** - elapsed time + electricity cost alone (always sent,
+   independent of whether filament data was available)
+
+This works for **any** filament, genuine or third-party, since it's the
+slicer's own calculated weight - not AMS RFID-based remaining-% tracking,
+which only works for genuine Bambu spools.
+
+Configure prices via `filamentPricesPerKg` (e.g. `{"PLA": 18.99, "PETG": 22.99}`).
+A material not in this map still shows its weight in the breakdown, just with
+"price not set" instead of a cost, and is excluded from the total (noted as
+"some materials unpriced" rather than silently treated as free).
+
+**Two real uncertainties worth knowing about:**
+- **The file path.** This assumes the project sits at `/cache/<subtask_name>.3mf`
+  (the convention when a print is sent from Bambu Studio), falling back to
+  root if not found there. If your prints are started a different way, this
+  might not find the file - check the log for "Couldn't find the project file"
+  and the exact paths it tried.
+- **The XML schema.** The exact attribute names Bambu Studio uses inside the
+  3MF's `Metadata/slice_info.config` for material type and weight aren't
+  independently verified here - if parsing comes up empty, the log prints the
+  raw XML/entry content it found instead of guessing, so the actual field
+  names can be confirmed and the code adjusted if needed.
+
+**Also worth knowing:** this opens a new FTP connection to the printer for
+every finished print. Given the camera's single-connection limit caused a real
+issue earlier, this hasn't been battle-tested for similar contention - worth
+watching the printer's health after a few real prints before fully trusting it
+during something you care about.
 
 ## Filament run-out setup
 

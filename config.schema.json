@@ -119,6 +119,20 @@
               "default": 5,
               "description": "Sends a notification every N percent complete, with time remaining. Set to 0 to disable."
             },
+            "startNotificationDelaySeconds": {
+              "title": "Print Started Notification Delay (seconds)",
+              "type": "number",
+              "default": 30,
+              "description": "Delays the \"Print started\" push (not the HomeKit switch) so the time estimate has a chance to populate first."
+            },
+            "filamentPricesPerKg": {
+              "title": "Filament Prices (£/kg by material)",
+              "type": "object",
+              "additionalProperties": {
+                "type": "number"
+              },
+              "description": "e.g. {\"PLA\": 18.99, \"PETG\": 22.99}. Homebridge UI's form may not render free-form key/value maps well - editing this via the raw JSON config editor is more reliable. A material not listed here still shows its weight, just without a cost."
+            },
             "includeCameraSnapshot": {
               "title": "Include a live camera snapshot in notifications",
               "type": "boolean",
