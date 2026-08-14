@@ -13,6 +13,25 @@ Exposes a Bambu Lab printer to HomeKit as:
   resumed from the touchscreen or app. (No "Stop"/cancel control - that's a
   one-way destructive action a toggle switch doesn't represent well, and it isn't
   included here.)
+- A **Contact Sensor ("Door")** — uses standard semantics (closed = detected,
+  open = not detected), matching every other HomeKit door/window sensor, so it
+  works naturally in the Home app's own automation builder - e.g. "when Door
+  opens and Occupancy is not detected, turn on Light" needs no extra plugin
+  code, just a normal HomeKit automation using accessories already exposed
+  here. Verified against real captured MQTT data (`home_flag` bit
+  `0x00800000`) - this signal was confirmed broken on X1C firmware
+  01.08.02.00 (Jan 2025) and confirmed working on 01.10.00.00 (Oct 2025), so
+  it should be fine on any reasonably current firmware, but worth a quick
+  physical door-open test to confirm on yours.
+- Three **Temperature Sensors ("Bed Temp"/"Nozzle Temp"/"Chamber Temp")** —
+  *off by default*, only appear if `showTemperatureSensors: true` is set.
+  Ranges are extended beyond HomeKit's default 0-100°C cap (nozzle up to
+  350°C, bed up to 150°C) so real readings don't get silently clipped.
+- A **Switch ("AMS Auto-Dry")** — experimental, opt-in (only appears if `amsId`
+  is configured). Enables/disables automatic threshold-based AMS 2 Pro drying -
+  not a direct dryer toggle, and deliberately not a humidity sensor tile. See
+  **AMS 2 Pro auto-dry (experimental)** below - this one has real unresolved
+  unknowns and needs calibration against your own logs.
 - A **Fan ("Progress")** — HomeKit has no native progress bar, so this repurposes
   a Fan's rotation-speed slider (0–100%) to show live print completion percentage,
   read straight from the printer's own `mc_percent` field rather than estimated
@@ -27,14 +46,23 @@ Exposes a Bambu Lab printer to HomeKit as:
   shows a percentage on the slider, not the profile name - there's no way to
   label slider positions in stock Home app. 25%=Silent, 50%=Standard,
   75%=Sport, 100%=Ludicrous.
+- A **Speed changed notification** — sent whenever the print speed profile
+  changes, whether triggered from HomeKit or externally (touchscreen/app),
+  since both paths update the same tracked value.
 - A **Programmable Switch ("Started")** — fires a single press when a print begins
   (a genuine start, not a resume from pause), and sends a Pingie push with the
   estimated duration and (if configured) estimated electricity cost.
 - A **Programmable Switch ("Finished")** — fires on completion, and sends a Pingie
   push with the actual elapsed time and cost.
 - A **Contact Sensor ("Fault")** — opens (triggers) whenever the printer reports a
-  nonzero `print_error` or an active HMS entry, and sends a Pingie push describing
-  it, so a failed print notifies you instead of you finding it hours later.
+  nonzero `print_error` or an active HMS entry, and sends a Pingie push
+  describing it - including a real decoded description for the HMS code where
+  one exists (sourced directly from Bambu's own official wiki, ~380 codes
+  bundled), a working deep link to `e.bambulab.com`, and falling back to just
+  the raw code if it's not in the table - so a failed print notifies you with
+  an actual explanation instead of you finding it hours later. The "Inspecting
+  first layer" HMS code is treated separately (see below) rather than
+  triggering this sensor, since it's informational, not a fault.
 - A **Contact Sensor ("Filament")** — opens when a `print_error` code you've
   confirmed corresponds to a filament run-out on your printer occurs, and sends
   a Pingie push. See **Filament run-out setup** below - this one needs a bit of
@@ -63,6 +91,8 @@ to tell apart at a glance:
 |---|---|
 | Print started | 🖨️ Print started |
 | Print progress | 🖨️ Print progress (every 5%, configurable) |
+| Bed heating | 🌡️ Bed heating (once, when it starts) |
+| Nozzle heating | 🌡️ Nozzle heating (once, when it starts) |
 | Print finished | ✅ Print finished |
 | Printer fault | 🚨 Printer fault |
 | Filament run-out | 🧵⚠️ Filament run-out |
@@ -180,6 +210,41 @@ For the "Finished" switch: Automation > printer's Finished switch > "Single Pres
 > Notification. For the "Fault" sensor: Automation > Fault sensor > "Opened" >
 Notification.
 
+## Preheating notifications
+
+Fires once when the bed or nozzle actually starts heading toward a real
+target (more than 2°C below it), not repeatedly while it climbs:
+
+**🌡️ Bed heating**
+> X1 Carbon: 24°C → 60°C.
+
+**🌡️ Nozzle heating**
+> X1 Carbon: 25°C → 220°C.
+
+No chamber equivalent - active chamber heating with a settable target is an
+X1E-only feature; the X1 Carbon's chamber just warms passively from the
+bed/nozzle inside the enclosure, so there's no meaningful "target" to notify
+about. No time-to-target estimate either - the printer doesn't report one,
+and a self-calculated guess (extrapolating from the current rate of rise)
+would be a genuine approximation rather than real data, and heating curves
+slow down noticeably as they approach target, so a naive estimate would
+consistently run optimistic.
+
+## First layer check notification
+
+Bambu's AI camera monitoring reports an "Inspecting first layer" HMS code
+(`0C00-0300-0003-000B`) during essentially every normal print that has this
+feature enabled - it's informational, not a fault, so it's pulled out of fault
+detection entirely and sent as its own notification instead:
+
+**👁️ First layer check**
+> X1 Carbon is inspecting the first layer.
+
+This does not open the Fault contact sensor and does not use the alarm emoji -
+genuine first-layer *problems* (spaghetti detected, defects found, inspection
+timed out, etc.) are separate HMS codes that still correctly trigger the
+regular 🚨 Printer fault notification.
+
 ## Error code descriptions
 
 Fault and filament-run-out notifications include a human-readable description
@@ -259,6 +324,46 @@ every finished print. Given the camera's single-connection limit caused a real
 issue earlier, this hasn't been battle-tested for similar contention - worth
 watching the printer's health after a few real prints before fully trusting it
 during something you care about.
+
+## AMS 2 Pro auto-dry (experimental)
+
+Opt-in - only active if `amsId` is set in config. Adds a **Switch ("AMS
+Auto-Dry")** that enables/disables automatic drying based on humidity
+crossing thresholds (hysteresis: starts at `amsDryStartThreshold`, stops at
+`amsDryStopThreshold`), plus four notifications:
+
+**🌬️ AMS Auto-Dry enabled** / **🌬️ AMS Auto-Dry disabled** - when you toggle
+the feature itself.
+
+**🌬️ AMS drying started** / **🌬️ AMS drying stopped** - when the automation
+actually starts/stops drying because a threshold was crossed.
+
+**Two real, unresolved unknowns before you rely on this:**
+
+- **The drying command's `ams_id`** doesn't follow the simple 0-3 unit
+  numbering used everywhere else in the protocol. It's reverse-engineered
+  from community experimentation (confirmed working by the person who found
+  it, using `131`) - there's no auto-detection, you'll need to find the right
+  value for your unit through experimentation, watching whether the AMS
+  actually starts heating on the touchscreen after sending a guess.
+- **Humidity threshold scale isn't confirmed to be a true percentage.** Even
+  an actively-maintained community integration has an *open, unanswered*
+  GitHub issue asking exactly this question - the protocol clearly exposes a
+  coarse 1-5 "index" in some contexts, while Bambu's own Handy app shows a
+  real percentage from an unidentified source. The plugin logs the raw
+  humidity value once with a hint if it looks like the coarse scale
+  (`<= 5`) - check the Homebridge log after enabling and adjust
+  `amsDryStartThreshold`/`amsDryStopThreshold` to match whatever it actually
+  shows, since the 50/40 defaults assume a real percentage.
+
+**Safety notes:** `amsDryTargetTemp` is clamped to a minimum of 45°C - the
+reverse-engineered command reportedly does nothing below that. The switch
+defaults to **Off on every Homebridge restart** rather than persisting state,
+deliberately - resuming a heater unattended after a restart isn't a
+reasonable default. Turning the switch off also immediately stops any drying
+it started. `amsDryDurationHours` (default 8) is sent as a hardware-level
+failsafe duration independent of this plugin's own stop command, in case that
+command never arrives for any reason (e.g. a dropped connection).
 
 ## Filament run-out setup
 

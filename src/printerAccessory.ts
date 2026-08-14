@@ -6,6 +6,7 @@ import AdmZip from 'adm-zip';
 import { XMLParser } from 'fast-xml-parser';
 import { BambuPrintStatusPlatform } from './platform';
 import { BAMBU_ERROR_CODES, KNOWN_FILAMENT_RUNOUT_CODES } from './bambuErrorCodes';
+import { BAMBU_HMS_CODES } from './bambuHmsCodes';
 
 export interface PrinterConfig {
   name: string;
@@ -70,6 +71,31 @@ export interface PrinterConfig {
   // tracking (which only works for genuine Bambu RFID spools). A material not
   // in this map still shows its weight, just without a cost figure.
   filamentPricesPerKg?: Record<string, number>;
+
+  // Optional temperature sensors (bed/nozzle/chamber) - off by default so a
+  // public plugin doesn't clutter Home app with tiles most people won't want.
+  showTemperatureSensors?: boolean;
+
+  // AMS 2 Pro remote drying control - opt-in, the switch/logic only gets
+  // created if amsId is set. The drying MQTT command is reverse-engineered
+  // (moderate-good confidence, confirmed by two independent sources), but
+  // ams_id doesn't follow the simple 0-3 unit numbering used elsewhere in the
+  // protocol - the one confirmed working example used 131, unexplained. No
+  // auto-detection attempted; this needs to be found by experimentation.
+  amsId?: number;
+  // Which index into the ams.ams[] array to read humidity from (separate from
+  // amsId above, which is only for the drying command itself). Defaults to 0
+  // (the first/only AMS unit).
+  amsHumidityUnitIndex?: number;
+  // Thresholds are on whatever scale the raw humidity field turns out to use -
+  // NOT confirmed to be a true 0-100% reading. The one AMS 2 Pro-specific
+  // community report found is an unresolved open issue asking for exactly
+  // this. Defaults assume a real percentage; if logs show a small 1-5 style
+  // index instead, these need adjusting to match.
+  amsDryStartThreshold?: number;
+  amsDryStopThreshold?: number;
+  amsDryTargetTemp?: number; // must be >=45 per the reverse-engineered command, enforced
+  amsDryDurationHours?: number; // hardware-level failsafe cutoff, independent of our own stop command
 }
 
 const DEFAULT_ACTIVE_STATES = ['RUNNING', 'PREPARE', 'PAUSE', 'SLICING'];
@@ -79,16 +105,28 @@ export class BambuPrinterAccessory {
   private readonly lightService: Service;
   private readonly progressService: Service;
   private readonly speedService: Service;
+  private amsAutoDryService?: Service;
+  private bedTempService?: Service;
+  private nozzleTempService?: Service;
+  private chamberTempService?: Service;
   private readonly pauseService: Service;
   private readonly startedSwitchService: Service;
   private readonly finishedSwitchService: Service;
   private readonly faultService: Service;
   private readonly filamentService: Service;
+  private readonly doorService: Service;
   private client?: mqtt.MqttClient;
   private chamberLightOn = false;
   private currentlyPaused = false;
+  private bedHeatingActive = false;
+  private nozzleHeatingActive = false;
+  private amsAutoDryEnabled = false; // defaults off on every restart - deliberate safety choice for a heater
+  private amsDryingActive = false;
+  private loggedHumidityScaleHint = false;
   private faultPresent = false;
+  private firstLayerCheckActive = false;
   private filamentOut = false;
+  private doorOpen = false;
   private previousGcodeState?: string;
   private printProgressPercent = 0;
   // 1=Silent, 2=Standard, 3=Sport, 4=Ludicrous. Tracked optimistically from
@@ -134,6 +172,7 @@ export class BambuPrinterAccessory {
       this.platform.Service.Fanv2.UUID,
       this.platform.Service.ContactSensor.UUID,
       this.platform.Service.StatelessProgrammableSwitch.UUID,
+      this.platform.Service.Switch.UUID,
     ];
     for (const existing of [...this.accessory.services]) {
       if (typesToDeduplicate.includes(existing.UUID) && !existing.subtype) {
@@ -276,13 +315,83 @@ export class BambuPrinterAccessory {
     // reversible): On while the printer is paused, Off while running. Reflects
     // real gcode_state so it stays in sync if paused/resumed from the touchscreen.
     this.pauseService =
-      this.accessory.getService(this.platform.Service.Switch) ||
-      this.accessory.addService(this.platform.Service.Switch, `${printerConfig.name} Pause`);
+      this.accessory.getServiceById(this.platform.Service.Switch, 'pause') ||
+      this.accessory.addService(this.platform.Service.Switch, `${printerConfig.name} Pause`, 'pause');
     this.pauseService.setCharacteristic(this.platform.Characteristic.Name, `${printerConfig.name} Pause`);
     this.pauseService
       .getCharacteristic(this.platform.Characteristic.On)
       .onGet(() => this.currentlyPaused)
       .onSet((value) => this.setPauseState(value as boolean));
+
+    // AMS 2 Pro auto-dry - opt-in, only created if amsId is configured. This
+    // is a Switch that enables/disables the automatic threshold-based drying
+    // logic (handled in handleMessage), NOT a direct dryer toggle - and
+    // deliberately not a humidity sensor tile, per your request. Defaults to
+    // Off on every Homebridge restart rather than persisting state, since
+    // this controls a physical heater and silently resuming that
+    // unattended after a restart isn't a reasonable default.
+    if (printerConfig.amsId !== undefined) {
+      this.amsAutoDryService =
+        this.accessory.getServiceById(this.platform.Service.Switch, 'ams-auto-dry') ||
+        this.accessory.addService(this.platform.Service.Switch, `${printerConfig.name} AMS Auto-Dry`, 'ams-auto-dry');
+      this.amsAutoDryService.setCharacteristic(
+        this.platform.Characteristic.Name,
+        `${printerConfig.name} AMS Auto-Dry`,
+      );
+      this.amsAutoDryService
+        .getCharacteristic(this.platform.Characteristic.On)
+        .onGet(() => this.amsAutoDryEnabled)
+        .onSet((value) => this.setAmsAutoDryEnabled(value as boolean));
+    }
+
+    // Optional temperature sensors - off by default, only created if
+    // showTemperatureSensors is explicitly enabled. HomeKit's
+    // CurrentTemperature characteristic defaults to a 0-100°C range, which
+    // would clip real nozzle readings (easily 220°C+) - extended explicitly
+    // for bed and nozzle below.
+    if (printerConfig.showTemperatureSensors) {
+      this.bedTempService =
+        this.accessory.getServiceById(this.platform.Service.TemperatureSensor, 'bed-temp') ||
+        this.accessory.addService(
+          this.platform.Service.TemperatureSensor,
+          `${printerConfig.name} Bed Temp`,
+          'bed-temp',
+        );
+      this.bedTempService.setCharacteristic(this.platform.Characteristic.Name, `${printerConfig.name} Bed Temp`);
+      this.bedTempService
+        .getCharacteristic(this.platform.Characteristic.CurrentTemperature)
+        .setProps({ minValue: -20, maxValue: 150 });
+
+      this.nozzleTempService =
+        this.accessory.getServiceById(this.platform.Service.TemperatureSensor, 'nozzle-temp') ||
+        this.accessory.addService(
+          this.platform.Service.TemperatureSensor,
+          `${printerConfig.name} Nozzle Temp`,
+          'nozzle-temp',
+        );
+      this.nozzleTempService.setCharacteristic(
+        this.platform.Characteristic.Name,
+        `${printerConfig.name} Nozzle Temp`,
+      );
+      this.nozzleTempService
+        .getCharacteristic(this.platform.Characteristic.CurrentTemperature)
+        .setProps({ minValue: -20, maxValue: 350 });
+
+      this.chamberTempService =
+        this.accessory.getServiceById(this.platform.Service.TemperatureSensor, 'chamber-temp') ||
+        this.accessory.addService(
+          this.platform.Service.TemperatureSensor,
+          `${printerConfig.name} Chamber Temp`,
+          'chamber-temp',
+        );
+      this.chamberTempService.setCharacteristic(
+        this.platform.Characteristic.Name,
+        `${printerConfig.name} Chamber Temp`,
+      );
+      this.chamberTempService
+        .getCharacteristic(this.platform.Characteristic.CurrentTemperature)
+        .setProps({ minValue: -20, maxValue: 100 });
+    }
 
     // Print-started / print-finished notifications - each fires a single "press"
     // on its transition, and separately triggers a Pingie push with the duration
@@ -362,7 +471,64 @@ export class BambuPrinterAccessory {
           : this.platform.Characteristic.ContactSensorState.CONTACT_DETECTED,
       );
 
+    // Door sensor - uses STANDARD contact sensor semantics (unlike Fault/
+    // Filament above, which are deliberately inverted for alarm-style
+    // automation triggering): DETECTED = closed, NOT_DETECTED = open, exactly
+    // matching every other HomeKit door/window sensor, so existing automation
+    // patterns work as expected. Verified against real captured MQTT data:
+    // home_flag bit 0x00800000 set = open, clear = closed. This bit was
+    // confirmed broken on X1C firmware 01.08.02.00 (Jan 2025) and confirmed
+    // working on 01.10.00.00 (Oct 2025) - almost certainly fine on current
+    // firmware, but worth a quick physical door-open test to be sure.
+    this.doorService =
+      this.accessory.getServiceById(this.platform.Service.ContactSensor, 'door') ||
+      this.accessory.addService(this.platform.Service.ContactSensor, `${printerConfig.name} Door`, 'door');
+    this.doorService.setCharacteristic(this.platform.Characteristic.Name, `${printerConfig.name} Door`);
+    this.doorService
+      .getCharacteristic(this.platform.Characteristic.ContactSensorState)
+      .onGet(() =>
+        this.doorOpen
+          ? this.platform.Characteristic.ContactSensorState.CONTACT_NOT_DETECTED
+          : this.platform.Characteristic.ContactSensorState.CONTACT_DETECTED,
+      );
+
     this.connect();
+  }
+
+  // The "Inspecting first layer" HMS code is informational - Bambu's AI camera
+  // monitoring reports this during essentially every normal print that has
+  // first-layer inspection enabled. It's not a fault and shouldn't trip the
+  // Fault sensor/alarm notification - handled as its own separate, non-alarming
+  // notification instead.
+  private static readonly FIRST_LAYER_CHECK_HMS_CODE = '0C00-0300-0003-000B';
+
+  // Decodes an hms entry's attr/code fields into Bambu's own 4-part display
+  // code format - confirmed correct against a real touchscreen error
+  // (0500-0500-0001-0007). Field names "attr"/"code" on the hms entry itself
+  // are moderate-confidence, not independently verified against a live
+  // payload - logs the raw entry if they're missing so this can be corrected.
+  private decodeHmsCode(entry: { attr?: number; code?: number }): string | undefined {
+    if (typeof entry.attr !== 'number' || typeof entry.code !== 'number') {
+      this.platform.log.warn(
+        `[${this.printerConfig.name}] HMS entry missing attr/code fields - raw: ${JSON.stringify(entry)}`,
+      );
+      return undefined;
+    }
+    const hexAttr = (entry.attr >>> 0).toString(16).toUpperCase().padStart(8, '0');
+    const hexCode = (entry.code >>> 0).toString(16).toUpperCase().padStart(8, '0');
+    const combined = hexAttr + hexCode;
+    return `${combined.slice(0, 4)}-${combined.slice(4, 8)}-${combined.slice(8, 12)}-${combined.slice(12, 16)}`;
+  }
+
+  // Formats an hms entry into a short human-readable description, falling
+  // back to the raw display code if nothing matches in the bundled table.
+  private formatHmsEntry(entry: { attr?: number; code?: number }): string | undefined {
+    const displayCode = this.decodeHmsCode(entry);
+    if (!displayCode) {
+      return undefined;
+    }
+    const description = BAMBU_HMS_CODES[displayCode];
+    return description ?? displayCode;
   }
 
   private hexKeyForCode(code: number): string {
@@ -409,6 +575,66 @@ export class BambuPrinterAccessory {
     this.currentSpeedLevel = level; // optimistic; reconciled against spd_lvl if/when it arrives
     const names = ['', 'Silent', 'Standard', 'Sport', 'Ludicrous'];
     this.platform.log.info(`[${this.printerConfig.name}] Print speed -> ${names[level]}`);
+    this.notifySpeedChange(level);
+  }
+
+  private notifySpeedChange(level: number) {
+    const names = ['', 'Silent', 'Standard', 'Sport', 'Ludicrous'];
+    void this.sendPingieNotificationWithSnapshot(
+      '🚀 Speed changed',
+      `${this.printerConfig.name}: now ${names[level]} (${level * 25}%).`,
+    );
+  }
+
+  // Sends the reverse-engineered AMS drying command. temp/cooling_temp are
+  // clamped to a minimum of 45 since the community report found the command
+  // silently no-ops below that. ams_id must be manually configured - it
+  // doesn't follow the simple 0-3 numbering used elsewhere in the protocol.
+  private sendAmsDryCommand(start: boolean) {
+    if (!this.client || !this.client.connected) {
+      this.platform.log.warn(`[${this.printerConfig.name}] Can't control AMS drying - not connected.`);
+      return;
+    }
+    const amsId = this.printerConfig.amsId;
+    if (amsId === undefined) {
+      return; // shouldn't happen - service is only created when amsId is set
+    }
+    const temp = Math.max(45, this.printerConfig.amsDryTargetTemp ?? 45);
+    const payload = JSON.stringify({
+      print: {
+        sequence_id: '0',
+        ams_id: amsId,
+        command: 'ams_filament_drying',
+        mode: start ? 1 : 0,
+        temp: start ? temp : 0,
+        cooling_temp: start ? temp : 40,
+        duration: start ? (this.printerConfig.amsDryDurationHours ?? 8) : 0,
+        humidity: 0,
+        rotate_tray: false,
+      },
+    });
+    this.client.publish(`device/${this.printerConfig.serialNumber}/request`, payload);
+    this.platform.log.info(`[${this.printerConfig.name}] AMS drying -> ${start ? 'START' : 'STOP'} (ams_id=${amsId})`);
+  }
+
+  private setAmsAutoDryEnabled(enabled: boolean) {
+    this.amsAutoDryEnabled = enabled;
+    this.platform.log.info(`[${this.printerConfig.name}] AMS Auto-Dry ${enabled ? 'ENABLED' : 'DISABLED'}`);
+    void this.sendPingieNotificationWithSnapshot(
+      enabled ? '🌬️ AMS Auto-Dry enabled' : '🌬️ AMS Auto-Dry disabled',
+      `${this.printerConfig.name}: automatic drying is now ${enabled ? 'on' : 'off'}.`,
+    );
+
+    // Turning the feature off also stops any drying it started, rather than
+    // leaving a heater running with nothing left to turn it off later.
+    if (!enabled && this.amsDryingActive) {
+      this.sendAmsDryCommand(false);
+      this.amsDryingActive = false;
+      void this.sendPingieNotificationWithSnapshot(
+        '🌬️ AMS drying stopped',
+        `${this.printerConfig.name}: stopped because Auto-Dry was turned off.`,
+      );
+    }
   }
 
   private setPauseState(pause: boolean) {
@@ -963,18 +1189,150 @@ export class BambuPrinterAccessory {
       this.pauseService.updateCharacteristic(this.platform.Characteristic.On, pausedNow);
     }
 
+    // Preheating notifications - fires once when bed/nozzle actually starts
+    // heading toward a real target, not repeatedly while it climbs. No chamber
+    // equivalent: active chamber heating with a settable target is an X1E-only
+    // feature, the X1 Carbon's chamber just warms passively. No time-to-target
+    // estimate either - the printer doesn't report one, and a self-calculated
+    // guess would be a genuine approximation, not real data.
+    const HEATING_MARGIN_C = 2;
+    const bedCurrent = Number(this.mergedState.bed_temper);
+    const bedTarget = Number(this.mergedState.bed_target_temper);
+    if (!Number.isNaN(bedCurrent) && !Number.isNaN(bedTarget)) {
+      const bedHeatingNow = bedTarget > 0 && bedCurrent < bedTarget - HEATING_MARGIN_C;
+      if (bedHeatingNow && !this.bedHeatingActive) {
+        void this.sendPingieNotificationWithSnapshot(
+          '🌡️ Bed heating',
+          `${this.printerConfig.name}: ${bedCurrent.toFixed(0)}°C → ${bedTarget.toFixed(0)}°C.`,
+        );
+      }
+      this.bedHeatingActive = bedHeatingNow;
+    }
+    if (this.bedTempService && !Number.isNaN(bedCurrent)) {
+      this.bedTempService.updateCharacteristic(this.platform.Characteristic.CurrentTemperature, bedCurrent);
+    }
+    const nozzleCurrent = Number(this.mergedState.nozzle_temper);
+    const nozzleTarget = Number(this.mergedState.nozzle_target_temper);
+    if (!Number.isNaN(nozzleCurrent) && !Number.isNaN(nozzleTarget)) {
+      const nozzleHeatingNow = nozzleTarget > 0 && nozzleCurrent < nozzleTarget - HEATING_MARGIN_C;
+      if (nozzleHeatingNow && !this.nozzleHeatingActive) {
+        void this.sendPingieNotificationWithSnapshot(
+          '🌡️ Nozzle heating',
+          `${this.printerConfig.name}: ${nozzleCurrent.toFixed(0)}°C → ${nozzleTarget.toFixed(0)}°C.`,
+        );
+      }
+      this.nozzleHeatingActive = nozzleHeatingNow;
+    }
+    if (this.nozzleTempService && !Number.isNaN(nozzleCurrent)) {
+      this.nozzleTempService.updateCharacteristic(this.platform.Characteristic.CurrentTemperature, nozzleCurrent);
+    }
+    if (this.chamberTempService) {
+      const chamberCurrent = Number(this.mergedState.chamber_temper);
+      if (!Number.isNaN(chamberCurrent)) {
+        this.chamberTempService.updateCharacteristic(
+          this.platform.Characteristic.CurrentTemperature,
+          chamberCurrent,
+        );
+      }
+    }
+
+    // Door sensor - see the service setup comment for the verified bit
+    // details. home_flag arrives as a (possibly negative) 32-bit signed int;
+    // >>> 0 converts it to unsigned before the bitwise check.
+    const homeFlag = this.mergedState.home_flag as number | undefined;
+    if (typeof homeFlag === 'number') {
+      const doorOpenNow = Boolean((homeFlag >>> 0) & 0x00800000);
+      if (doorOpenNow !== this.doorOpen) {
+        this.doorOpen = doorOpenNow;
+        this.doorService.updateCharacteristic(
+          this.platform.Characteristic.ContactSensorState,
+          doorOpenNow
+            ? this.platform.Characteristic.ContactSensorState.CONTACT_NOT_DETECTED
+            : this.platform.Characteristic.ContactSensorState.CONTACT_DETECTED,
+        );
+      }
+    }
+
+    // AMS 2 Pro auto-dry threshold logic - only runs while the switch is on.
+    // Humidity scale is NOT confirmed to be a true percentage (see config
+    // comments) - logs a one-time hint if the raw value looks like it might
+    // be a coarse 1-5 index instead, so thresholds can be recalibrated.
+    if (this.amsAutoDryEnabled && this.printerConfig.amsId !== undefined) {
+      const amsArray = (this.mergedState.ams as { ams?: Array<{ humidity?: string | number }> } | undefined)?.ams;
+      const unitIndex = this.printerConfig.amsHumidityUnitIndex ?? 0;
+      const rawHumidity = amsArray?.[unitIndex]?.humidity;
+      const humidity = rawHumidity !== undefined ? Number(rawHumidity) : NaN;
+
+      if (!Number.isNaN(humidity)) {
+        if (!this.loggedHumidityScaleHint) {
+          this.loggedHumidityScaleHint = true;
+          this.platform.log.info(
+            `[${this.printerConfig.name}] AMS humidity raw value: ${humidity}` +
+              (humidity <= 5
+                ? ' - this looks like it might be a coarse 1-5 index rather than a true percentage. ' +
+                  'If your thresholds never trigger, this is likely why - adjust amsDryStartThreshold/' +
+                  'amsDryStopThreshold to match this scale instead.'
+                : ''),
+          );
+        }
+
+        const startThreshold = this.printerConfig.amsDryStartThreshold ?? 50;
+        const stopThreshold = this.printerConfig.amsDryStopThreshold ?? 40;
+
+        if (!this.amsDryingActive && humidity >= startThreshold) {
+          this.amsDryingActive = true;
+          this.sendAmsDryCommand(true);
+          void this.sendPingieNotificationWithSnapshot(
+            '🌬️ AMS drying started',
+            `${this.printerConfig.name}: humidity reached ${humidity} (threshold ${startThreshold}).`,
+          );
+        } else if (this.amsDryingActive && humidity <= stopThreshold) {
+          this.amsDryingActive = false;
+          this.sendAmsDryCommand(false);
+          void this.sendPingieNotificationWithSnapshot(
+            '🌬️ AMS drying stopped',
+            `${this.printerConfig.name}: humidity dropped to ${humidity} (threshold ${stopThreshold}).`,
+          );
+        }
+      }
+    }
+
     // Fault/error alert - a nonzero print_error or any active hms entries means
-    // something needs attention.
+    // something needs attention. The "Inspecting first layer" hms code is
+    // pulled out separately below since it's informational, not a fault.
     const printError = this.mergedState.print_error as number | undefined;
-    const hms = this.mergedState.hms as Array<unknown> | undefined;
-    const faultNow = Boolean(printError && printError !== 0) || Boolean(hms && hms.length > 0);
+    const hms = this.mergedState.hms as Array<{ attr?: number; code?: number }> | undefined;
+    const hmsEntries = Array.isArray(hms) ? hms : [];
+    const firstLayerCheckEntries = hmsEntries.filter(
+      (e) => this.decodeHmsCode(e) === BambuPrinterAccessory.FIRST_LAYER_CHECK_HMS_CODE,
+    );
+    const realHmsEntries = hmsEntries.filter(
+      (e) => this.decodeHmsCode(e) !== BambuPrinterAccessory.FIRST_LAYER_CHECK_HMS_CODE,
+    );
+
+    // First layer check - informational only, own low-key notification, no
+    // effect on the Fault sensor.
+    const firstLayerCheckActive = firstLayerCheckEntries.length > 0;
+    if (firstLayerCheckActive !== this.firstLayerCheckActive) {
+      this.firstLayerCheckActive = firstLayerCheckActive;
+      if (firstLayerCheckActive) {
+        void this.sendPingieNotificationWithSnapshot(
+          '👁️ First layer check',
+          `${this.printerConfig.name} is inspecting the first layer.`,
+        );
+      }
+    }
+
+    const faultNow = Boolean(printError && printError !== 0) || realHmsEntries.length > 0;
     if (faultNow !== this.faultPresent) {
       this.faultPresent = faultNow;
       const description = printError ? this.describeError(printError) : undefined;
+      const hmsFormatted = realHmsEntries.map((e) => this.formatHmsEntry(e)).filter((s): s is string => Boolean(s));
+
       this.platform.log.info(
         `[${this.printerConfig.name}] Fault ${faultNow ? 'DETECTED' : 'CLEARED'} ` +
           `(print_error=${printError ?? 'none'}${description ? ` - ${description}` : ''}, ` +
-          `hms_entries=${hms?.length ?? 0})`,
+          `hms=[${hmsFormatted.join('; ')}])`,
       );
       this.faultService.updateCharacteristic(
         this.platform.Characteristic.ContactSensorState,
@@ -983,12 +1341,19 @@ export class BambuPrinterAccessory {
           : this.platform.Characteristic.ContactSensorState.CONTACT_DETECTED,
       );
       if (faultNow) {
-        const codeSuffix = printError ? ` (${this.hexKeyForCode(printError)})` : '';
-        const body = description
-          ? `${this.printerConfig.name}: ${description}${codeSuffix}`
-          : `${this.printerConfig.name} reported a fault (print_error=${printError ?? 'unknown'}, ` +
-            `${hms?.length ?? 0} active HMS entries). Check the printer.`;
-        void this.sendPingieNotificationWithSnapshot('🚨 Printer fault', body);
+        const bodyParts: string[] = [];
+        if (description) {
+          bodyParts.push(`${this.printerConfig.name}: ${description} (${this.hexKeyForCode(printError!)})`);
+        } else if (printError) {
+          bodyParts.push(`${this.printerConfig.name}: print_error=${printError}`);
+        }
+        if (hmsFormatted.length > 0) {
+          bodyParts.push(`HMS: ${hmsFormatted.join(', ')}`);
+        }
+        if (bodyParts.length === 0) {
+          bodyParts.push(`${this.printerConfig.name} reported a fault. Check the printer.`);
+        }
+        void this.sendPingieNotificationWithSnapshot('🚨 Printer fault', bodyParts.join(' '));
       }
     }
 
@@ -1061,6 +1426,10 @@ export class BambuPrinterAccessory {
         const parts = jobName
           ? [`Print started on ${this.printerConfig.name}: "${jobName}".`]
           : [`Print started on ${this.printerConfig.name}.`];
+        const totalLayerNum = this.mergedState.total_layer_num as number | undefined;
+        if (typeof totalLayerNum === 'number' && totalLayerNum > 0) {
+          parts.push(`${totalLayerNum} layers.`);
+        }
         if (this.printEstimatedTotalMinutes) {
           parts.push(`Estimated time: ${this.formatDuration(this.printEstimatedTotalMinutes)}.`);
           const cost = this.estimateCost(this.printEstimatedTotalMinutes);
@@ -1127,6 +1496,7 @@ export class BambuPrinterAccessory {
     if (typeof spdLvl === 'number' && [1, 2, 3, 4].includes(spdLvl) && spdLvl !== this.currentSpeedLevel) {
       this.currentSpeedLevel = spdLvl;
       this.speedService.updateCharacteristic(this.platform.Characteristic.RotationSpeed, spdLvl * 25);
+      this.notifySpeedChange(spdLvl);
     }
 
     const mcPercent = this.mergedState.mc_percent as number | undefined;
@@ -1150,9 +1520,15 @@ export class BambuPrinterAccessory {
             typeof remaining === 'number' && remaining >= 0
               ? `${this.formatDuration(remaining)} remaining`
               : 'time remaining not available yet';
+          const layerNum = this.mergedState.layer_num as number | undefined;
+          const totalLayerNum = this.mergedState.total_layer_num as number | undefined;
+          const layerText =
+            typeof layerNum === 'number' && typeof totalLayerNum === 'number' && totalLayerNum > 0
+              ? ` Layer ${layerNum}/${totalLayerNum}.`
+              : '';
           void this.sendPingieNotificationWithSnapshot(
             '🖨️ Print progress',
-            `${this.printerConfig.name}: ${bucket}% complete - ${remainingText}.`,
+            `${this.printerConfig.name}: ${bucket}% complete - ${remainingText}.${layerText}`,
           );
         }
       }

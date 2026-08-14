@@ -133,6 +133,46 @@
               },
               "description": "e.g. {\"PLA\": 18.99, \"PETG\": 22.99}. Homebridge UI's form may not render free-form key/value maps well - editing this via the raw JSON config editor is more reliable. A material not listed here still shows its weight, just without a cost."
             },
+            "showTemperatureSensors": {
+              "title": "Show bed/nozzle/chamber temperature sensors",
+              "type": "boolean",
+              "default": false,
+              "description": "Off by default. Adds three Temperature Sensor accessories to Home app."
+            },
+            "amsId": {
+              "title": "AMS 2 Pro Drying ID (experimental)",
+              "type": "number",
+              "description": "Required to enable AMS Auto-Dry - no default, no auto-detection. Doesn't follow simple 0-3 numbering; the one confirmed working example used 131. Leave blank to skip this feature entirely."
+            },
+            "amsHumidityUnitIndex": {
+              "title": "AMS Humidity Unit Index",
+              "type": "number",
+              "default": 0,
+              "description": "Which AMS unit (array position, not amsId) to read humidity from. 0 = first/only unit."
+            },
+            "amsDryStartThreshold": {
+              "title": "AMS Dry Start Threshold",
+              "type": "number",
+              "default": 50,
+              "description": "Scale not confirmed - check the Homebridge log after enabling for a hint about whether this is a real percentage or a coarse 1-5 index."
+            },
+            "amsDryStopThreshold": {
+              "title": "AMS Dry Stop Threshold",
+              "type": "number",
+              "default": 40
+            },
+            "amsDryTargetTemp": {
+              "title": "AMS Dry Target Temp (°C)",
+              "type": "number",
+              "default": 45,
+              "description": "Clamped to a minimum of 45 - the reverse-engineered command reportedly no-ops below that."
+            },
+            "amsDryDurationHours": {
+              "title": "AMS Dry Hardware Failsafe Duration (hours)",
+              "type": "number",
+              "default": 8,
+              "description": "Hardware-level cutoff independent of this plugin's own stop command, in case that never arrives (e.g. connection drop)."
+            },
             "includeCameraSnapshot": {
               "title": "Include a live camera snapshot in notifications",
               "type": "boolean",
