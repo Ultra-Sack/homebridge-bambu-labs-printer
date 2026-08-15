@@ -96,6 +96,8 @@ to tell apart at a glance:
 | Print finished | ✅ Print finished |
 | Printer fault | 🚨 Printer fault |
 | Filament run-out | 🧵⚠️ Filament run-out |
+| Connection lost | ⚠️ Connection lost (after N failed reconnects, configurable) |
+| Connection restored | ✅ Connection restored |
 
 ## Electricity cost estimates
 

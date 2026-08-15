@@ -67,6 +67,12 @@
               "type": "number",
               "default": 10
             },
+            "mqttReconnectAlertThreshold": {
+              "title": "Connection Lost Alert Threshold (attempts)",
+              "type": "number",
+              "default": 5,
+              "description": "Sends a \"check the printer\" push after this many consecutive failed reconnect attempts, then again every that-many attempts while it stays down. Set to 0 to disable."
+            },
             "activeStates": {
               "title": "gcode_state values treated as \"occupied\"",
               "type": "array",

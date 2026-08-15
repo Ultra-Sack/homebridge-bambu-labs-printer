@@ -18,6 +18,11 @@ export interface PrinterConfig {
   rejectUnauthorized?: boolean;
   refreshIntervalSeconds?: number;
   reconnectDelaySeconds?: number;
+  // Sends a "check the printer" Pingie push after this many consecutive
+  // failed reconnect attempts, then again every that-many attempts while it
+  // stays down, so a lost connection doesn't just go silent. Set to 0 to
+  // disable. Defaults to 5.
+  mqttReconnectAlertThreshold?: number;
   // gcode_state values that should be treated as "occupied" (printer actively in use).
   activeStates?: string[];
   // print_error codes (as reported by the printer, e.g. "83935248") confirmed to mean
@@ -147,6 +152,7 @@ export class BambuPrinterAccessory {
   private currentlyOccupied = false;
 
   private reconnectTimer?: ReturnType<typeof setTimeout>;
+  private consecutiveReconnectFailures = 0;
   private refreshTimer?: ReturnType<typeof setInterval>;
   private readonly activeStates: string[];
 
@@ -1088,6 +1094,17 @@ export class BambuPrinterAccessory {
       this.platform.log.info(`[${this.printerConfig.name}] MQTT connected`);
       this.service.updateCharacteristic(this.platform.Characteristic.StatusActive, true);
 
+      // If we'd previously alerted about a dropped connection, let them know
+      // it's back rather than leaving that as the last thing they heard.
+      const threshold = this.printerConfig.mqttReconnectAlertThreshold ?? 5;
+      if (threshold > 0 && this.consecutiveReconnectFailures >= threshold) {
+        void this.sendPingieNotificationWithSnapshot(
+          '✅ Connection restored',
+          `${this.printerConfig.name}: reconnected after ${this.consecutiveReconnectFailures} failed attempts.`,
+        );
+      }
+      this.consecutiveReconnectFailures = 0;
+
       this.client!.subscribe(`device/${this.printerConfig.serialNumber}/report`, (err) => {
         if (err) {
           this.platform.log.error(`[${this.printerConfig.name}] Subscribe failed: ${err.message}`);
@@ -1107,6 +1124,17 @@ export class BambuPrinterAccessory {
     this.client.on('close', () => {
       this.service.updateCharacteristic(this.platform.Characteristic.StatusActive, false);
       this.stopRefreshTimer();
+
+      this.consecutiveReconnectFailures += 1;
+      const threshold = this.printerConfig.mqttReconnectAlertThreshold ?? 5;
+      if (threshold > 0 && this.consecutiveReconnectFailures % threshold === 0) {
+        void this.sendPingieNotificationWithSnapshot(
+          '⚠️ Connection lost',
+          `${this.printerConfig.name}: unable to reconnect after ${this.consecutiveReconnectFailures} attempts. ` +
+            'Check the printer and current print status.',
+        );
+      }
+
       this.scheduleReconnect();
     });
   }
