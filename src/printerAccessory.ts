@@ -1111,11 +1111,28 @@ export class BambuPrinterAccessory {
         }
       });
 
+      // Also watch the /request topic - not our own commands (those go out,
+      // they don't loop back), but commands sent by OTHER clients on the same
+      // broker, like Bambu Studio/Handy's native buttons. Lets us discover
+      // things like the real AMS drying ams_id just by watching what Studio's
+      // own "Dry" button sends, without needing a separate MQTT client tool.
+      this.client!.subscribe(`device/${this.printerConfig.serialNumber}/request`, (err) => {
+        if (err) {
+          this.platform.log.warn(`[${this.printerConfig.name}] Couldn't subscribe to /request: ${err.message}`);
+        }
+      });
+
       this.requestFullState();
       this.startRefreshTimer();
     });
 
-    this.client.on('message', (_topic, payload) => this.handleMessage(payload));
+    this.client.on('message', (topic, payload) => {
+      if (topic.endsWith('/report')) {
+        this.handleMessage(payload);
+      } else if (topic.endsWith('/request')) {
+        this.sniffOtherClientCommand(payload);
+      }
+    });
 
     this.client.on('error', (err) => {
       this.platform.log.warn(`[${this.printerConfig.name}] MQTT error: ${err.message}`);
@@ -1173,6 +1190,32 @@ export class BambuPrinterAccessory {
       pushing: { sequence_id: '0', command: 'pushall' },
     });
     this.client.publish(`device/${this.printerConfig.serialNumber}/request`, payload);
+  }
+
+  // Watches commands sent by OTHER clients (Bambu Studio, Handy, the
+  // touchscreen) on the same broker - never our own outgoing commands, those
+  // don't loop back to us. Purely diagnostic/logging, changes no state.
+  private sniffOtherClientCommand(payload: Buffer) {
+    let parsed: Record<string, unknown>;
+    try {
+      parsed = JSON.parse(payload.toString());
+    } catch {
+      return;
+    }
+    const printCommand = (parsed?.print as Record<string, unknown> | undefined)?.command;
+    if (printCommand === 'ams_filament_drying') {
+      const amsId = (parsed.print as Record<string, unknown>).ams_id;
+      this.platform.log.info(
+        `[${this.printerConfig.name}] Observed an AMS drying command from another client - ` +
+          `ams_id=${amsId}. Use this value for the "amsId" config field.`,
+      );
+    } else if (printCommand) {
+      // Any other command from another client - logged for visibility/future
+      // debugging, not specially handled.
+      this.platform.log.debug(
+        `[${this.printerConfig.name}] Observed command "${printCommand}" from another client.`,
+      );
+    }
   }
 
   private handleMessage(payload: Buffer) {

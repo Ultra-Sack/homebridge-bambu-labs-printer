@@ -345,9 +345,12 @@ actually starts/stops drying because a threshold was crossed.
 - **The drying command's `ams_id`** doesn't follow the simple 0-3 unit
   numbering used everywhere else in the protocol. It's reverse-engineered
   from community experimentation (confirmed working by the person who found
-  it, using `131`) - there's no auto-detection, you'll need to find the right
-  value for your unit through experimentation, watching whether the AMS
-  actually starts heating on the touchscreen after sending a guess.
+  it, using `131`) - there's no auto-detection built into the command itself,
+  but the plugin watches the `/request` topic for commands sent by *other*
+  clients (Bambu Studio, Handy, the touchscreen) on the same connection -
+  press the native "Dry" button in Bambu Studio's Device page and check the
+  Homebridge log for a line like `Observed an AMS drying command from
+  another client - ams_id=131`, no separate MQTT tool needed.
 - **Humidity threshold scale isn't confirmed to be a true percentage.** Even
   an actively-maintained community integration has an *open, unanswered*
   GitHub issue asking exactly this question - the protocol clearly exposes a
