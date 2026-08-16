@@ -23,6 +23,11 @@ export interface PrinterConfig {
   // stays down, so a lost connection doesn't just go silent. Set to 0 to
   // disable. Defaults to 5.
   mqttReconnectAlertThreshold?: number;
+  // Diagnostic-only, off by default to keep MQTT traffic minimal. Subscribes
+  // to the /request topic to sniff commands sent by other clients (Bambu
+  // Studio's native buttons) - only useful while actively hunting for
+  // something like the AMS drying ams_id. Turn off again once found.
+  enableRequestTopicSniffing?: boolean;
   // gcode_state values that should be treated as "occupied" (printer actively in use).
   activeStates?: string[];
   // print_error codes (as reported by the printer, e.g. "83935248") confirmed to mean
@@ -1105,22 +1110,43 @@ export class BambuPrinterAccessory {
       }
       this.consecutiveReconnectFailures = 0;
 
-      this.client!.subscribe(`device/${this.printerConfig.serialNumber}/report`, (err) => {
+      this.client!.subscribe(`device/${this.printerConfig.serialNumber}/report`, (err, granted) => {
         if (err) {
           this.platform.log.error(`[${this.printerConfig.name}] Subscribe failed: ${err.message}`);
+        } else if (granted?.[0]?.qos === 128) {
+          this.platform.log.error(
+            `[${this.printerConfig.name}] Broker rejected the /report subscription (ACL denial) - ` +
+              'this would explain the plugin not receiving any status at all.',
+          );
         }
       });
 
+      // Diagnostic-only, off by default - see enableRequestTopicSniffing.
       // Also watch the /request topic - not our own commands (those go out,
       // they don't loop back), but commands sent by OTHER clients on the same
       // broker, like Bambu Studio/Handy's native buttons. Lets us discover
       // things like the real AMS drying ams_id just by watching what Studio's
       // own "Dry" button sends, without needing a separate MQTT client tool.
-      this.client!.subscribe(`device/${this.printerConfig.serialNumber}/request`, (err) => {
-        if (err) {
-          this.platform.log.warn(`[${this.printerConfig.name}] Couldn't subscribe to /request: ${err.message}`);
-        }
-      });
+      // Some brokers grant a subscription at the protocol level while quietly
+      // denying it via an ACL (qos 128 in the granted response) rather than
+      // returning a JS-level error - checked explicitly here since a silent
+      // ACL denial would otherwise look identical to "no messages happened".
+      if (this.printerConfig.enableRequestTopicSniffing) {
+        this.client!.subscribe(`device/${this.printerConfig.serialNumber}/request`, (err, granted) => {
+          if (err) {
+            this.platform.log.warn(`[${this.printerConfig.name}] Couldn't subscribe to /request: ${err.message}`);
+          } else if (granted?.[0]?.qos === 128) {
+            this.platform.log.warn(
+              `[${this.printerConfig.name}] Broker rejected the /request subscription (ACL denial) - ` +
+                'the printer likely doesn\'t allow third-party clients to listen to command traffic, ' +
+                'even though it accepts commands published there. The AMS ID sniffer won\'t work; ' +
+                'you\'ll need to find it another way (e.g. a working MQTT client tool, if one connects).',
+            );
+          } else {
+            this.platform.log.info(`[${this.printerConfig.name}] Subscribed to /request (granted qos=${granted?.[0]?.qos}).`);
+          }
+        });
+      }
 
       this.requestFullState();
       this.startRefreshTimer();
@@ -1170,7 +1196,16 @@ export class BambuPrinterAccessory {
 
   private startRefreshTimer() {
     this.stopRefreshTimer();
-    const seconds = this.printerConfig.refreshIntervalSeconds ?? 60;
+    // Off by default (0). The printer already pushes updates continuously on
+    // its own, and a full refresh already happens on every (re)connect - the
+    // periodic version only guards against a message silently vanishing
+    // while the connection stays up the whole time, which is a rare edge
+    // case compared to an actual disconnect (already handled separately).
+    // Set a positive value only if you want that extra safety net back.
+    const seconds = this.printerConfig.refreshIntervalSeconds ?? 0;
+    if (seconds <= 0) {
+      return;
+    }
     this.refreshTimer = setInterval(() => this.requestFullState(), seconds * 1000);
   }
 
@@ -1200,9 +1235,13 @@ export class BambuPrinterAccessory {
     try {
       parsed = JSON.parse(payload.toString());
     } catch {
+      this.platform.log.debug(`[${this.printerConfig.name}] Received unparseable /request payload.`);
       return;
     }
     const printCommand = (parsed?.print as Record<string, unknown> | undefined)?.command;
+    this.platform.log.debug(
+      `[${this.printerConfig.name}] Observed /request traffic - command="${printCommand ?? 'none'}".`,
+    );
     if (printCommand === 'ams_filament_drying') {
       const amsId = (parsed.print as Record<string, unknown>).ams_id;
       this.platform.log.info(

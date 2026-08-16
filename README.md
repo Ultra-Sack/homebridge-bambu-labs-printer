@@ -170,7 +170,7 @@ TypeScript installed, so building directly on the NAS/container will fail.
       "mqttPort": 8883,
       "mqttUsername": "bblp",
       "rejectUnauthorized": false,
-      "refreshIntervalSeconds": 60,
+      "refreshIntervalSeconds": 0,
       "reconnectDelaySeconds": 10,
       "activeStates": ["RUNNING", "PREPARE", "PAUSE", "SLICING"],
       "filamentRunoutErrorCodes": [],
@@ -192,10 +192,16 @@ won't power off the plug mid-print. Other states you may see: `IDLE`, `FINISH`,
 
 - Subscribes to `device/<serial>/report` over MQTT/TLS (self-signed cert, hence
   `rejectUnauthorized: false` by default).
-- On connect, and every `refreshIntervalSeconds`, publishes a `pushall` request
-  to `device/<serial>/request` — Bambu printers otherwise only send *diffs*
-  after the first message, so this keeps the plugin's view of state complete
-  rather than relying on catching every partial update.
+- On connect (and after every reconnect), publishes one `pushall` request to
+  `device/<serial>/request` — Bambu printers otherwise only send *diffs* after
+  the first message, so this establishes a complete baseline. After that, the
+  printer's own continuous status pushes keep the plugin's view current -
+  `refreshIntervalSeconds` (off/0 by default) only adds a *periodic* repeat of
+  this request as extra insurance against a message silently going missing
+  while the connection stays up the whole time, which is a rare edge case
+  compared to an actual disconnect (already handled by the reconnect-triggered
+  refresh). Not needed for normal operation; set a positive value only if
+  you've actually seen fields go stale without a disconnect happening.
 - Merges each incoming message into a cached state object and re-derives
   `gcode_state` from it, only touching HomeKit when occupancy actually changes.
 - Reconnects automatically after `reconnectDelaySeconds` on disconnect, and
@@ -346,11 +352,14 @@ actually starts/stops drying because a threshold was crossed.
   numbering used everywhere else in the protocol. It's reverse-engineered
   from community experimentation (confirmed working by the person who found
   it, using `131`) - there's no auto-detection built into the command itself,
-  but the plugin watches the `/request` topic for commands sent by *other*
-  clients (Bambu Studio, Handy, the touchscreen) on the same connection -
-  press the native "Dry" button in Bambu Studio's Device page and check the
-  Homebridge log for a line like `Observed an AMS drying command from
-  another client - ams_id=131`, no separate MQTT tool needed.
+  but setting `enableRequestTopicSniffing: true` makes the plugin watch the
+  `/request` topic for commands sent by *other* clients (Bambu Studio, Handy,
+  the touchscreen) on the same connection - press the native "Dry" button in
+  Bambu Studio's Device page and check the Homebridge log for a line like
+  `Observed an AMS drying command from another client - ams_id=131`, no
+  separate MQTT tool needed. **This is off by default to keep MQTT traffic
+  minimal** - turn it on temporarily while hunting for the value, then back
+  off once found.
 - **Humidity threshold scale isn't confirmed to be a true percentage.** Even
   an actively-maintained community integration has an *open, unanswered*
   GitHub issue asking exactly this question - the protocol clearly exposes a

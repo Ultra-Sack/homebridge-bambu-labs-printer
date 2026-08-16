@@ -60,7 +60,8 @@
             "refreshIntervalSeconds": {
               "title": "Full State Refresh Interval (seconds)",
               "type": "number",
-              "default": 60
+              "default": 0,
+              "description": "Off by default (0). The printer already pushes updates continuously on its own, and a full refresh already happens on every (re)connect - this periodic version only guards against a message silently vanishing while the connection stays up, a rare edge case. Set a positive value only if you want that extra safety net back."
             },
             "reconnectDelaySeconds": {
               "title": "Reconnect Delay (seconds)",
@@ -72,6 +73,12 @@
               "type": "number",
               "default": 5,
               "description": "Sends a \"check the printer\" push after this many consecutive failed reconnect attempts, then again every that-many attempts while it stays down. Set to 0 to disable."
+            },
+            "enableRequestTopicSniffing": {
+              "title": "Enable AMS ID sniffer (diagnostic, off by default)",
+              "type": "boolean",
+              "default": false,
+              "description": "Subscribes to the /request topic to discover values like the AMS drying ams_id by watching Bambu Studio's own commands. Turn on temporarily while hunting for a value, then back off - keeps MQTT traffic minimal otherwise."
             },
             "activeStates": {
               "title": "gcode_state values treated as \"occupied\"",
