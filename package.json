@@ -1,6 +1,6 @@
 {
   "name": "homebridge-bambu-print-status",
-  "version": "1.13.1",
+  "version": "1.17.0",
   "description": "Homebridge plugin exposing a Bambu Lab printer's print status as a HomeKit Occupancy Sensor, for driving automations (e.g. powering down via a smart plug) when the printer goes idle.",
   "main": "dist/index.js",
   "author": "Alex (Ultra-Sack)",
@@ -36,7 +36,8 @@
     "mqtt": "^5.10.1",
     "basic-ftp": "^5.0.5",
     "adm-zip": "^0.5.16",
-    "fast-xml-parser": "^4.5.0"
+    "fast-xml-parser": "^4.5.0",
+    "ping": "^0.4.4"
   },
   "devDependencies": {
     "@types/node": "^20.11.0",

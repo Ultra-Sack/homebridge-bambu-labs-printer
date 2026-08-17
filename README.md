@@ -36,7 +36,8 @@ Exposes a Bambu Lab printer to HomeKit as:
   a Fan's rotation-speed slider (0–100%) to show live print completion percentage,
   read straight from the printer's own `mc_percent` field rather than estimated
   from time. It's read-only: dragging the slider or toggling it in the Home app
-  just snaps back to the real value.
+  just snaps back to the real value. **Configurable via `progressDisplayMode`**
+  (default `"both"`) - set to `"valve"` to hide this one, see below.
 - A **Fan ("Speed")** — snapped to exactly 4 positions (25/50/75/100%), mapped
   to Bambu's Silent/Standard/Sport/Ludicrous speed profiles. Sends the
   `print_speed` MQTT command with the level as a JSON string (`"1"`-`"4"`) -
@@ -44,8 +45,27 @@ Exposes a Bambu Lab printer to HomeKit as:
   (confirmed on P1 series, plausibly others) where sending the wrong type
   causes a garbage speed multiplier. **Real limitation:** the Home app only
   shows a percentage on the slider, not the profile name - there's no way to
-  label slider positions in stock Home app. 25%=Silent, 50%=Standard,
-  75%=Sport, 100%=Ludicrous.
+  label slider positions in stock Home app. Slider range is 0/25/50/75/100 -
+  0 isn't a real speed and is safely rejected/reverted if selected (only
+  1-4/25-100 are valid), it's just there to match HomeKit's true default
+  minValue for better compatibility with the Home app's cached characteristic
+  range. 25%=Silent, 50%=Standard, 75%=Sport, 100%=Ludicrous.
+- A **Valve ("Time Remaining")** — repurposes HomeKit's `RemainingDuration`
+  characteristic (designed for irrigation cycle countdowns) to show a real,
+  native countdown of print time remaining, mirroring `mc_remaining_time`.
+  Also sets `SetDuration` (the total planned duration) alongside it, since
+  Home app's sprinkler-style UI typically renders a visual progress ring when
+  both are present together - **untested here**, worth checking your Home
+  app directly to confirm the ring actually shows before treating this as
+  settled. Unlike the Progress/Speed fan hacks, this gives an actual
+  purpose-built countdown UI - the tradeoff is a generic valve/sprinkler icon
+  on the tile, since that's the underlying HomeKit service type. Both
+  durations extended to a 24h range (from the typical 1h irrigation default)
+  for multi-hour prints. Read-only, same revert-on-manual-toggle pattern as
+  Progress/Speed's Active characteristics. **Configurable via
+  `progressDisplayMode`** (default `"both"`) - set to `"fan"` to hide this
+  one. Switching either mode automatically removes the tile(s) no longer in
+  use rather than leaving an orphan behind.
 - A **Speed changed notification** — sent whenever the print speed profile
   changes, whether triggered from HomeKit or externally (touchscreen/app),
   since both paths update the same tracked value.
@@ -202,6 +222,30 @@ won't power off the plug mid-print. Other states you may see: `IDLE`, `FINISH`,
   compared to an actual disconnect (already handled by the reconnect-triggered
   refresh). Not needed for normal operation; set a positive value only if
   you've actually seen fields go stale without a disconnect happening.
+  **Real-world evidence, not just theory:** disabling this periodic refresh
+  coincided with a printer network-stack freeze stopping recurring for one
+  user - not proof of causation on its own, but a strong enough signal that
+  leaving this off by default is the right call, not just a traffic-reduction
+  nicety.
+- Reconnects use **exponential backoff** (`reconnectDelaySeconds` doubling up
+  to `reconnectMaxDelaySeconds`, default ceiling 5 minutes), not a constant
+  retry rate. Reasoning ties to the same evidence above: if a printer-side
+  hang involves any kind of resource contention, retrying every few seconds
+  indefinitely could plausibly add load to something already struggling
+  rather than helping - backing off during an extended outage is the safer
+  default regardless of whether that's the actual mechanism.
+- **Optionally** (`enableNetworkPresenceCheck`, off by default), reconnects
+  can be ping-gated instead: check every `presenceCheckIntervalSeconds`
+  (default 30s) whether the printer answers a basic network ping at all
+  before ever attempting a real MQTT/TLS handshake, skipping the attempt
+  entirely if it doesn't. This targets a *different* failure mode than the
+  backoff above - a printer that's genuinely off the network (confirmed real
+  in community reports of WiFi dropping out) rather than an app-layer hang
+  that might still respond to ping. **Fails open**: if the ping check itself
+  doesn't work in your environment (a real risk - some minimal Docker images
+  lack a working `ping` binary or the permissions to use it), it falls back
+  to reconnecting normally rather than silently refusing to ever reconnect
+  again because of an environment limitation.
 - Merges each incoming message into a cached state object and re-derives
   `gcode_state` from it, only touching HomeKit when occupancy actually changes.
 - Reconnects automatically after `reconnectDelaySeconds` on disconnect, and

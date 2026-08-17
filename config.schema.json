@@ -66,7 +66,25 @@
             "reconnectDelaySeconds": {
               "title": "Reconnect Delay (seconds)",
               "type": "number",
-              "default": 10
+              "default": 10,
+              "description": "Base delay before the first retry - doubles with each consecutive failure (exponential backoff) up to reconnectMaxDelaySeconds, rather than retrying at a constant rate forever."
+            },
+            "reconnectMaxDelaySeconds": {
+              "title": "Reconnect Max Delay (seconds)",
+              "type": "number",
+              "default": 300,
+              "description": "Ceiling for the exponential backoff above - retries won't wait longer than this even during an extended outage."
+            },
+            "enableNetworkPresenceCheck": {
+              "title": "Ping-gate reconnects (off by default)",
+              "type": "boolean",
+              "default": false,
+              "description": "Pings the printer before attempting a real MQTT connection - skips the attempt entirely if it's not even reachable at the network layer. Falls back to reconnecting normally if the ping check itself doesn't work in your environment (some minimal Docker containers lack a working ping binary)."
+            },
+            "presenceCheckIntervalSeconds": {
+              "title": "Presence Check Interval (seconds)",
+              "type": "number",
+              "default": 30
             },
             "mqttReconnectAlertThreshold": {
               "title": "Connection Lost Alert Threshold (attempts)",
@@ -145,6 +163,13 @@
                 "type": "number"
               },
               "description": "e.g. {\"PLA\": 18.99, \"PETG\": 22.99}. Homebridge UI's form may not render free-form key/value maps well - editing this via the raw JSON config editor is more reliable. A material not listed here still shows its weight, just without a cost."
+            },
+            "progressDisplayMode": {
+              "title": "Progress Display",
+              "type": "string",
+              "enum": ["fan", "valve", "both"],
+              "default": "both",
+              "description": "\"fan\" = Progress % slider only. \"valve\" = Time Remaining countdown only. \"both\" = both accessories. Switching modes automatically removes the tile(s) no longer in use."
             },
             "showTemperatureSensors": {
               "title": "Show bed/nozzle/chamber temperature sensors",

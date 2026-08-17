@@ -4,6 +4,8 @@ import { Client as FtpClient } from 'basic-ftp';
 import { Writable } from 'stream';
 import AdmZip from 'adm-zip';
 import { XMLParser } from 'fast-xml-parser';
+// eslint-disable-next-line @typescript-eslint/no-var-requires
+const ping = require('ping') as { promise: { probe: (host: string) => Promise<{ alive: boolean }> } };
 import { BambuPrintStatusPlatform } from './platform';
 import { BAMBU_ERROR_CODES, KNOWN_FILAMENT_RUNOUT_CODES } from './bambuErrorCodes';
 import { BAMBU_HMS_CODES } from './bambuHmsCodes';
@@ -18,6 +20,16 @@ export interface PrinterConfig {
   rejectUnauthorized?: boolean;
   refreshIntervalSeconds?: number;
   reconnectDelaySeconds?: number;
+  reconnectMaxDelaySeconds?: number;
+  // Opt-in, off by default. Instead of always attempting a real MQTT/TLS
+  // handshake, pings the printer's IP first - only attempts the actual
+  // connection if the ping succeeds, and skips it entirely (checking again
+  // next cycle) if the printer isn't even reachable at the network layer.
+  // Helps most when the printer is genuinely off-network (confirmed real
+  // failure mode); may help less for an app-layer hang that still responds
+  // to ping. No downside either way.
+  enableNetworkPresenceCheck?: boolean;
+  presenceCheckIntervalSeconds?: number;
   // Sends a "check the printer" Pingie push after this many consecutive
   // failed reconnect attempts, then again every that-many attempts while it
   // stays down, so a lost connection doesn't just go silent. Set to 0 to
@@ -82,6 +94,12 @@ export interface PrinterConfig {
   // in this map still shows its weight, just without a cost figure.
   filamentPricesPerKg?: Record<string, number>;
 
+  // Which progress-style accessory(ies) to expose: the Progress fan
+  // (0-100% slider), the Time Remaining valve (countdown + progress ring,
+  // ring rendering not independently confirmed), or both. Defaults to
+  // "both" to preserve existing behaviour for anyone already using this.
+  progressDisplayMode?: 'fan' | 'valve' | 'both';
+
   // Optional temperature sensors (bed/nozzle/chamber) - off by default so a
   // public plugin doesn't clutter Home app with tiles most people won't want.
   showTemperatureSensors?: boolean;
@@ -113,8 +131,9 @@ const DEFAULT_ACTIVE_STATES = ['RUNNING', 'PREPARE', 'PAUSE', 'SLICING'];
 export class BambuPrinterAccessory {
   private readonly service: Service;
   private readonly lightService: Service;
-  private readonly progressService: Service;
+  private progressService?: Service;
   private readonly speedService: Service;
+  private countdownService?: Service;
   private amsAutoDryService?: Service;
   private bedTempService?: Service;
   private nozzleTempService?: Service;
@@ -139,6 +158,8 @@ export class BambuPrinterAccessory {
   private doorOpen = false;
   private previousGcodeState?: string;
   private printProgressPercent = 0;
+  private remainingDurationSeconds = 0;
+  private setDurationSeconds = 0;
   // 1=Silent, 2=Standard, 3=Sport, 4=Ludicrous. Tracked optimistically from
   // our own commands; also reconciled against the printer's own spd_lvl
   // field when present in the report (moderate, not fully verified confidence
@@ -158,6 +179,7 @@ export class BambuPrinterAccessory {
 
   private reconnectTimer?: ReturnType<typeof setTimeout>;
   private consecutiveReconnectFailures = 0;
+  private loggedPingUnavailableWarning = false;
   private refreshTimer?: ReturnType<typeof setInterval>;
   private readonly activeStates: string[];
 
@@ -245,48 +267,60 @@ export class BambuPrinterAccessory {
     // by the printer's own reported mc_percent rather than a time-based
     // estimate. Active/RotationSpeed are read-only display - any attempt to
     // change them from the Home app just snaps back to the real value.
-    this.progressService =
-      this.accessory.getServiceById(this.platform.Service.Fanv2, 'progress') ||
-      this.accessory.addService(this.platform.Service.Fanv2, `${printerConfig.name} Progress`, 'progress');
-    this.progressService.setCharacteristic(
-      this.platform.Characteristic.Name,
-      `${printerConfig.name} Progress`,
-    );
-    this.progressService
-      .getCharacteristic(this.platform.Characteristic.Active)
-      .onGet(() =>
-        this.currentlyOccupied
-          ? this.platform.Characteristic.Active.ACTIVE
-          : this.platform.Characteristic.Active.INACTIVE,
-      )
-      .onSet(() => {
-        // Read-only: revert any manual toggle back to the real state.
-        setTimeout(
-          () =>
-            this.progressService.updateCharacteristic(
-              this.platform.Characteristic.Active,
-              this.currentlyOccupied
-                ? this.platform.Characteristic.Active.ACTIVE
-                : this.platform.Characteristic.Active.INACTIVE,
-            ),
-          0,
-        );
-      });
-    this.progressService
-      .getCharacteristic(this.platform.Characteristic.RotationSpeed)
-      .setProps({ minValue: 0, maxValue: 100, minStep: 1 })
-      .onGet(() => this.printProgressPercent)
-      .onSet(() => {
-        // Read-only: revert any manual drag back to the real percentage.
-        setTimeout(
-          () =>
-            this.progressService.updateCharacteristic(
-              this.platform.Characteristic.RotationSpeed,
-              this.printProgressPercent,
-            ),
-          0,
-        );
-      });
+    // Only created if progressDisplayMode includes "fan" (default "both").
+    const progressMode = printerConfig.progressDisplayMode ?? 'both';
+    if (progressMode === 'fan' || progressMode === 'both') {
+      this.progressService =
+        this.accessory.getServiceById(this.platform.Service.Fanv2, 'progress') ||
+        this.accessory.addService(this.platform.Service.Fanv2, `${printerConfig.name} Progress`, 'progress');
+      const progressService = this.progressService;
+      progressService.setCharacteristic(
+        this.platform.Characteristic.Name,
+        `${printerConfig.name} Progress`,
+      );
+      progressService
+        .getCharacteristic(this.platform.Characteristic.Active)
+        .onGet(() =>
+          this.currentlyOccupied
+            ? this.platform.Characteristic.Active.ACTIVE
+            : this.platform.Characteristic.Active.INACTIVE,
+        )
+        .onSet(() => {
+          // Read-only: revert any manual toggle back to the real state.
+          setTimeout(
+            () =>
+              progressService.updateCharacteristic(
+                this.platform.Characteristic.Active,
+                this.currentlyOccupied
+                  ? this.platform.Characteristic.Active.ACTIVE
+                  : this.platform.Characteristic.Active.INACTIVE,
+              ),
+            0,
+          );
+        });
+      progressService
+        .getCharacteristic(this.platform.Characteristic.RotationSpeed)
+        .setProps({ minValue: 0, maxValue: 100, minStep: 1 })
+        .onGet(() => this.printProgressPercent)
+        .onSet(() => {
+          // Read-only: revert any manual drag back to the real percentage.
+          setTimeout(
+            () =>
+              progressService.updateCharacteristic(
+                this.platform.Characteristic.RotationSpeed,
+                this.printProgressPercent,
+              ),
+            0,
+          );
+        });
+    } else {
+      // Mode is "valve" only - remove any previously-created Progress fan so
+      // switching modes doesn't leave an orphaned tile behind.
+      const existing = this.accessory.getServiceById(this.platform.Service.Fanv2, 'progress');
+      if (existing) {
+        this.accessory.removeService(existing);
+      }
+    }
 
     // Print speed profile - HomeKit has no native 4-way selector, so this
     // reuses the same Fan-slider trick as Progress, snapped to exactly 4
@@ -318,9 +352,87 @@ export class BambuPrinterAccessory {
       });
     this.speedService
       .getCharacteristic(this.platform.Characteristic.RotationSpeed)
-      .setProps({ minValue: 25, maxValue: 100, minStep: 25 })
+      .setProps({ minValue: 0, maxValue: 100, minStep: 25 })
       .onGet(() => this.currentSpeedLevel * 25)
       .onSet((value) => this.setPrintSpeed(Math.round((value as number) / 25)));
+
+    // Countdown timer - uses the Valve service's RemainingDuration
+    // characteristic, which is a real HomeKit-native countdown display
+    // (originally designed for irrigation cycles), rather than a repurposed
+    // slider. Home app will show a generic valve/sprinkler-style icon for
+    // this tile - a cosmetic mismatch, but it's the only characteristic that
+    // gives an actual countdown UI. Default range caps at 3600s (1 hour, the
+    // normal irrigation use case) - extended here to 24h for multi-hour
+    // prints. Active/InUse are read-only display, reverting any manual
+    // toggle back to the real occupancy state, same pattern as Progress/Speed.
+    // Only created if progressDisplayMode includes "valve" (default "both").
+    if (progressMode === 'valve' || progressMode === 'both') {
+      this.countdownService =
+        this.accessory.getServiceById(this.platform.Service.Valve, 'countdown') ||
+        this.accessory.addService(this.platform.Service.Valve, `${printerConfig.name} Time Remaining`, 'countdown');
+      const countdownService = this.countdownService;
+      countdownService.setCharacteristic(
+        this.platform.Characteristic.Name,
+        `${printerConfig.name} Time Remaining`,
+      );
+      countdownService.setCharacteristic(this.platform.Characteristic.ValveType, 0); // Generic Valve
+      countdownService
+        .getCharacteristic(this.platform.Characteristic.Active)
+        .onGet(() =>
+          this.currentlyOccupied
+            ? this.platform.Characteristic.Active.ACTIVE
+            : this.platform.Characteristic.Active.INACTIVE,
+        )
+        .onSet(() => {
+          setTimeout(
+            () =>
+              countdownService.updateCharacteristic(
+                this.platform.Characteristic.Active,
+                this.currentlyOccupied
+                  ? this.platform.Characteristic.Active.ACTIVE
+                  : this.platform.Characteristic.Active.INACTIVE,
+              ),
+            0,
+          );
+        });
+      countdownService
+        .getCharacteristic(this.platform.Characteristic.InUse)
+        .onGet(() =>
+          this.currentlyOccupied
+            ? this.platform.Characteristic.InUse.IN_USE
+            : this.platform.Characteristic.InUse.NOT_IN_USE,
+        );
+      countdownService
+        .getCharacteristic(this.platform.Characteristic.RemainingDuration)
+        .setProps({ minValue: 0, maxValue: 86400 })
+        .onGet(() => this.remainingDurationSeconds);
+      // SetDuration (the total planned duration) alongside RemainingDuration -
+      // Home app's sprinkler-style UI typically renders a visual progress ring
+      // when both are present together. Read-only like everything else here:
+      // a real irrigation valve would START running for this long if you set
+      // it, which we never want, so any manual set reverts immediately.
+      countdownService
+        .getCharacteristic(this.platform.Characteristic.SetDuration)
+        .setProps({ minValue: 0, maxValue: 86400 })
+        .onGet(() => this.setDurationSeconds)
+        .onSet(() => {
+          setTimeout(
+            () =>
+              countdownService.updateCharacteristic(
+                this.platform.Characteristic.SetDuration,
+                this.setDurationSeconds,
+              ),
+            0,
+          );
+        });
+    } else {
+      // Mode is "fan" only - remove any previously-created Time Remaining
+      // valve so switching modes doesn't leave an orphaned tile behind.
+      const existing = this.accessory.getServiceById(this.platform.Service.Valve, 'countdown');
+      if (existing) {
+        this.accessory.removeService(existing);
+      }
+    }
 
     // Pause/Resume - a genuine two-state Switch (unlike Stop, this is safely
     // reversible): On while the printer is paused, Off while running. Reflects
@@ -1186,12 +1298,68 @@ export class BambuPrinterAccessory {
     if (this.reconnectTimer) {
       return;
     }
-    const delay = (this.printerConfig.reconnectDelaySeconds ?? 10) * 1000;
+
+    if (this.printerConfig.enableNetworkPresenceCheck) {
+      // Ping-gated mode: check presence on a fixed interval, only attempt a
+      // real MQTT connection if the printer actually answers. Skips the
+      // connection attempt entirely (but keeps checking) if it doesn't.
+      const intervalSeconds = this.printerConfig.presenceCheckIntervalSeconds ?? 30;
+      this.reconnectTimer = setTimeout(async () => {
+        this.reconnectTimer = undefined;
+        // Fail OPEN, not closed: if the ping check itself errors (e.g. no
+        // `ping` binary or no raw-ICMP permission in this environment - a
+        // real risk in minimal Docker containers), that's a broken presence
+        // check, not evidence the printer is unreachable. Falls back to
+        // attempting the real connection rather than silently refusing to
+        // reconnect forever because of an environment limitation.
+        let alive = true;
+        let checkFailed = false;
+        try {
+          const res = await ping.promise.probe(this.printerConfig.ipAddress);
+          alive = res.alive;
+        } catch (err) {
+          checkFailed = true;
+          if (!this.loggedPingUnavailableWarning) {
+            this.loggedPingUnavailableWarning = true;
+            this.platform.log.warn(
+              `[${this.printerConfig.name}] Presence check (ping) isn't working in this environment ` +
+                `(${(err as Error).message}) - falling back to reconnecting without it. Consider setting ` +
+                'enableNetworkPresenceCheck to false if this persists.',
+            );
+          }
+        }
+
+        if (alive || checkFailed) {
+          if (!checkFailed) {
+            this.platform.log.info(`[${this.printerConfig.name}] Printer is on the network - attempting reconnect.`);
+          }
+          this.connect();
+        } else {
+          this.platform.log.debug(`[${this.printerConfig.name}] Printer not reachable - skipping connection attempt.`);
+          this.scheduleReconnect(); // keep checking on the same interval
+        }
+      }, intervalSeconds * 1000);
+      return;
+    }
+
+    // Default mode: exponential backoff, no presence check. Doubles each
+    // consecutive failure (capped at reconnectMaxDelaySeconds), resetting to
+    // the base delay on the next successful connect. If a hang involves any
+    // kind of resource contention on the printer's side, repeatedly
+    // hammering it with fresh connection attempts every few seconds
+    // indefinitely could plausibly be adding load to something already
+    // struggling rather than helping - this backs off instead of retrying
+    // at a constant rate forever.
+    const baseDelay = this.printerConfig.reconnectDelaySeconds ?? 10;
+    const maxDelay = this.printerConfig.reconnectMaxDelaySeconds ?? 300;
+    const multiplier = Math.pow(2, Math.min(this.consecutiveReconnectFailures, 10));
+    const delaySeconds = Math.min(baseDelay * multiplier, maxDelay);
+
     this.reconnectTimer = setTimeout(() => {
       this.reconnectTimer = undefined;
-      this.platform.log.info(`[${this.printerConfig.name}] Reconnecting...`);
+      this.platform.log.info(`[${this.printerConfig.name}] Reconnecting... (next attempt after ${delaySeconds}s if this fails)`);
       this.connect();
-    }, delay);
+    }, delaySeconds * 1000);
   }
 
   private startRefreshTimer() {
@@ -1512,6 +1680,8 @@ export class BambuPrinterAccessory {
       // notification below can't accidentally use last print's number.
       delete this.mergedState.mc_remaining_time;
       this.printEstimatedTotalMinutes = undefined;
+      this.setDurationSeconds = 0;
+      this.countdownService?.updateCharacteristic(this.platform.Characteristic.SetDuration, 0);
 
       this.platform.log.info(`[${this.printerConfig.name}] Print started.`);
       this.startedSwitchService.updateCharacteristic(
@@ -1531,6 +1701,13 @@ export class BambuPrinterAccessory {
         this.startNotificationTimer = undefined;
         const remaining = this.mergedState.mc_remaining_time as number | undefined;
         this.printEstimatedTotalMinutes = typeof remaining === 'number' && remaining > 0 ? remaining : undefined;
+        if (this.printEstimatedTotalMinutes) {
+          this.setDurationSeconds = Math.min(this.printEstimatedTotalMinutes * 60, 86400);
+          this.countdownService?.updateCharacteristic(
+            this.platform.Characteristic.SetDuration,
+            this.setDurationSeconds,
+          );
+        }
         const jobName = this.mergedState.subtask_name as string | undefined;
 
         const parts = jobName
@@ -1573,6 +1750,8 @@ export class BambuPrinterAccessory {
 
       this.printStartTimestamp = undefined;
       this.printEstimatedTotalMinutes = undefined;
+      this.setDurationSeconds = 0;
+      this.countdownService?.updateCharacteristic(this.platform.Characteristic.SetDuration, 0);
     }
     this.previousGcodeState = gcodeState;
 
@@ -1590,11 +1769,23 @@ export class BambuPrinterAccessory {
           ? this.platform.Characteristic.OccupancyDetected.OCCUPANCY_DETECTED
           : this.platform.Characteristic.OccupancyDetected.OCCUPANCY_NOT_DETECTED,
       );
-      this.progressService.updateCharacteristic(
+      this.progressService?.updateCharacteristic(
         this.platform.Characteristic.Active,
         occupied
           ? this.platform.Characteristic.Active.ACTIVE
           : this.platform.Characteristic.Active.INACTIVE,
+      );
+      this.countdownService?.updateCharacteristic(
+        this.platform.Characteristic.Active,
+        occupied
+          ? this.platform.Characteristic.Active.ACTIVE
+          : this.platform.Characteristic.Active.INACTIVE,
+      );
+      this.countdownService?.updateCharacteristic(
+        this.platform.Characteristic.InUse,
+        occupied
+          ? this.platform.Characteristic.InUse.IN_USE
+          : this.platform.Characteristic.InUse.NOT_IN_USE,
       );
     }
 
@@ -1614,7 +1805,7 @@ export class BambuPrinterAccessory {
       const clamped = Math.max(0, Math.min(100, Math.round(mcPercent)));
       if (clamped !== this.printProgressPercent) {
         this.printProgressPercent = clamped;
-        this.progressService.updateCharacteristic(
+        this.progressService?.updateCharacteristic(
           this.platform.Characteristic.RotationSpeed,
           clamped,
         );
@@ -1642,6 +1833,20 @@ export class BambuPrinterAccessory {
           );
         }
       }
+    }
+
+    // Countdown timer - RemainingDuration in seconds, mirrors occupancy for
+    // Active/InUse so the tile reads 0/"not in use" once printing stops.
+    const remainingMinutes = this.mergedState.mc_remaining_time as number | undefined;
+    const remainingSeconds = occupied && typeof remainingMinutes === 'number' && remainingMinutes > 0
+      ? Math.min(remainingMinutes * 60, 86400)
+      : 0;
+    if (remainingSeconds !== this.remainingDurationSeconds) {
+      this.remainingDurationSeconds = remainingSeconds;
+      this.countdownService?.updateCharacteristic(
+        this.platform.Characteristic.RemainingDuration,
+        remainingSeconds,
+      );
     }
   }
 
