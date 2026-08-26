@@ -50,25 +50,29 @@ Exposes a Bambu Lab printer to HomeKit as:
   1-4/25-100 are valid), it's just there to match HomeKit's true default
   minValue for better compatibility with the Home app's cached characteristic
   range. 25%=Silent, 50%=Standard, 75%=Sport, 100%=Ludicrous.
-- A **Valve ("Time Remaining")** — repurposes HomeKit's `RemainingDuration`
-  characteristic (designed for irrigation cycle countdowns) to show a real,
-  native countdown of print time remaining, mirroring `mc_remaining_time`.
-  Also sets `SetDuration` (the total planned duration) alongside it, since
-  Home app's sprinkler-style UI typically renders a visual progress ring when
-  both are present together - **untested here**, worth checking your Home
-  app directly to confirm the ring actually shows before treating this as
-  settled. Unlike the Progress/Speed fan hacks, this gives an actual
-  purpose-built countdown UI - the tradeoff is a generic valve/sprinkler icon
-  on the tile, since that's the underlying HomeKit service type. Both
-  durations extended to a 24h range (from the typical 1h irrigation default)
-  for multi-hour prints. Read-only, same revert-on-manual-toggle pattern as
-  Progress/Speed's Active characteristics. **Configurable via
+- A **Light Sensor ("Countdown")** — repurposes `CurrentAmbientLightLevel`
+  (lux) to show time remaining as MM.SS - whole number is minutes, decimal is
+  seconds (e.g. `222.30` = 3h 42m 30s). Ticks locally once per second between
+  real `mc_remaining_time` updates (which only have minute precision from the
+  printer), resyncing to the real value whenever a fresh one arrives so it
+  can't drift far - gives a smoothly counting-down display rather than one
+  that jumps once a minute. **Untested display precision:** Home app's own
+  lux formatting may not show two decimal places consistently, which could
+  make single-digit seconds (e.g. `45.06`) round or truncate unpredictably -
+  worth checking directly once deployed. **Configurable via
   `progressDisplayMode`** (default `"both"`) - set to `"fan"` to hide this
   one. Switching either mode automatically removes the tile(s) no longer in
   use rather than leaving an orphan behind.
 - A **Speed changed notification** — sent whenever the print speed profile
   changes, whether triggered from HomeKit or externally (touchscreen/app),
-  since both paths update the same tracked value.
+  since both paths update the same tracked value. **Debounced**: right after
+  you set a speed from HomeKit, reconciliation notifications are suppressed
+  for 5 seconds (the printer's own status can briefly lag behind before
+  catching up, which would otherwise misread as a genuine external change and
+  fire a spurious "changed to X" notification mid-transition). After that
+  window, exactly one check runs - if it settled on something other than
+  what you asked for, that's a real correction and gets its own notification
+  and a live slider update; if it matches, nothing further fires.
 - A **Programmable Switch ("Started")** — fires a single press when a print begins
   (a genuine start, not a resume from pause), and sends a Pingie push with the
   estimated duration and (if configured) estimated electricity cost.
@@ -208,6 +212,27 @@ defaults treat a filament-change `PAUSE` as still occupied, so an automation
 won't power off the plug mid-print. Other states you may see: `IDLE`, `FINISH`,
 `FAILED` — these are left out of the default active list on purpose.
 
+## Known-resolved: printer freezing/hanging
+
+If you experienced the printer's screen/network stack becoming unresponsive
+(motion sometimes continuing, sometimes stalling too) - **this was confirmed
+resolved**, and the real root cause turned out to be **outside this plugin
+entirely**: a camera.ui NVR configuration keeping a continuous RTSPS
+connection open to the printer's camera 24/7 via `prebuffering: true`,
+`videoanalysis.active: true`, and HomeKit Secure Video recording - all three
+require constantly reading the live stream, not just when actually viewing
+or recording. Disabling all three (`prebuffering: false`,
+`videoanalysis.active: false`, and turning off HKSV for the camera in the
+Home app) resolved it after sustained testing across multiple prints.
+
+If you're hitting similar symptoms: check your camera.ui/NVR tool's recording
+settings first, specifically anything that keeps the stream continuously
+open rather than on-demand, before assuming it's this plugin or the printer
+itself. This plugin's own MQTT traffic was investigated as a possible
+contributor too (see `refreshIntervalSeconds`/reconnect backoff below) and
+reducing it is still good practice on its own merits, but the camera
+connection was the actual fix.
+
 ## How it works
 
 - Subscribes to `device/<serial>/report` over MQTT/TLS (self-signed cert, hence
@@ -221,18 +246,17 @@ won't power off the plug mid-print. Other states you may see: `IDLE`, `FINISH`,
   while the connection stays up the whole time, which is a rare edge case
   compared to an actual disconnect (already handled by the reconnect-triggered
   refresh). Not needed for normal operation; set a positive value only if
-  you've actually seen fields go stale without a disconnect happening.
-  **Real-world evidence, not just theory:** disabling this periodic refresh
-  coincided with a printer network-stack freeze stopping recurring for one
-  user - not proof of causation on its own, but a strong enough signal that
-  leaving this off by default is the right call, not just a traffic-reduction
-  nicety.
+  you've actually seen fields go stale without a disconnect happening. Kept
+  off by default as good minimal-traffic practice, even though the actual
+  freeze culprit turned out to be camera.ui, not this - see "Known-resolved"
+  above.
 - Reconnects use **exponential backoff** (`reconnectDelaySeconds` doubling up
   to `reconnectMaxDelaySeconds`, default ceiling 5 minutes), not a constant
-  retry rate. Reasoning ties to the same evidence above: if a printer-side
-  hang involves any kind of resource contention, retrying every few seconds
-  indefinitely could plausibly add load to something already struggling
-  rather than helping - backing off during an extended outage is the safer
+  retry rate. Sensible defensive practice regardless of root cause: if a
+  printer-side hang involves any kind of resource contention, retrying every
+  few seconds indefinitely could plausibly add load to something already
+  struggling rather than helping - backing off during an extended outage is
+  the safer default either way.
   default regardless of whether that's the actual mechanism.
 - **Optionally** (`enableNetworkPresenceCheck`, off by default), reconnects
   can be ping-gated instead: check every `presenceCheckIntervalSeconds`
@@ -354,22 +378,30 @@ This works for **any** filament, genuine or third-party, since it's the
 slicer's own calculated weight - not AMS RFID-based remaining-% tracking,
 which only works for genuine Bambu spools.
 
-Configure prices via `filamentPricesPerKg` (e.g. `{"PLA": 18.99, "PETG": 22.99}`).
-A material not in this map still shows its weight in the breakdown, just with
-"price not set" instead of a cost, and is excluded from the total (noted as
-"some materials unpriced" rather than silently treated as free).
+Configure prices via `filamentPrices` in the Homebridge UI - a real add/edit
+list (Material + Price per kg per row), no JSON editing required. Verified
+end-to-end against a real sliced file: parsed weight matched the file's own
+declared total exactly. A material not added to the list still shows its
+weight in the breakdown, just with "price not set" instead of a cost, and is
+excluded from the total (noted as "some materials unpriced" rather than
+silently treated as free). Material names must match exactly what's in your
+sliced files (case-sensitive) - `PLA`, `PETG`, `ABS`, or a composite like
+`PLA-CF` if that's what you print.
 
-**Two real uncertainties worth knowing about:**
+**One real uncertainty remaining** (the XML schema itself is now confirmed,
+see below):
 - **The file path.** This assumes the project sits at `/cache/<subtask_name>.3mf`
   (the convention when a print is sent from Bambu Studio), falling back to
   root if not found there. If your prints are started a different way, this
   might not find the file - check the log for "Couldn't find the project file"
   and the exact paths it tried.
-- **The XML schema.** The exact attribute names Bambu Studio uses inside the
-  3MF's `Metadata/slice_info.config` for material type and weight aren't
-  independently verified here - if parsing comes up empty, the log prints the
-  raw XML/entry content it found instead of guessing, so the actual field
-  names can be confirmed and the code adjusted if needed.
+
+**The XML schema itself is confirmed, not just assumed** - verified against a
+real sliced 3MF file's `Metadata/slice_info.config`: `type="PLA"` and
+`used_g="124.29"` style attributes on `<filament>` elements, parsed weight
+summed to exactly the file's own declared plate total (126.48g). The earlier
+uncertainty here has been resolved; the code hasn't changed, just the
+confidence level.
 
 **Also worth knowing:** this opens a new FTP connection to the printer for
 every finished print. Given the camera's single-connection limit caused a real

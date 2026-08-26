@@ -48,7 +48,7 @@ export interface PrinterConfig {
   filamentRunoutErrorCodes?: string[];
 
   // Pingie "Notify!" group push notifications - both are required to enable notifications.
-  // Get these from the Notify! app (Group settings), or GET /link on notifypush.pingie.com
+  // Get these from the Notify! app (Group settings), or GET /link on push.getnotifyapp.com
   // to confirm them.
   pingieGroupId?: string;
   pingieGroupToken?: string;
@@ -92,13 +92,14 @@ export interface PrinterConfig {
   // sliced 3MF file's own metadata via FTP rather than AMS remaining-%
   // tracking (which only works for genuine Bambu RFID spools). A material not
   // in this map still shows its weight, just without a cost figure.
-  filamentPricesPerKg?: Record<string, number>;
+  filamentPrices?: Array<{ material: string; pricePerKg: number }>;
 
   // Which progress-style accessory(ies) to expose: the Progress fan
-  // (0-100% slider), the Time Remaining valve (countdown + progress ring,
-  // ring rendering not independently confirmed), or both. Defaults to
-  // "both" to preserve existing behaviour for anyone already using this.
-  progressDisplayMode?: 'fan' | 'valve' | 'both';
+  // (0-100% slider), the Countdown light sensor (lux value encodes
+  // MM.SS - minutes as the whole number, seconds as the decimal), or both.
+  // Defaults to "both" to preserve existing behaviour for anyone already
+  // using this.
+  progressDisplayMode?: 'fan' | 'countdown' | 'both';
 
   // Optional temperature sensors (bed/nozzle/chamber) - off by default so a
   // public plugin doesn't clutter Home app with tiles most people won't want.
@@ -158,13 +159,15 @@ export class BambuPrinterAccessory {
   private doorOpen = false;
   private previousGcodeState?: string;
   private printProgressPercent = 0;
-  private remainingDurationSeconds = 0;
-  private setDurationSeconds = 0;
+  private countdownSecondsRemaining = 0;
+  private countdownTicker?: ReturnType<typeof setInterval>;
   // 1=Silent, 2=Standard, 3=Sport, 4=Ludicrous. Tracked optimistically from
   // our own commands; also reconciled against the printer's own spd_lvl
   // field when present in the report (moderate, not fully verified confidence
   // in that exact field name - falls back to optimistic tracking if absent).
   private currentSpeedLevel = 2;
+  private speedCommandCooldownUntil = 0;
+  private speedCommandCorrectionTimer?: ReturnType<typeof setTimeout>;
   private printStartTimestamp?: number;
   private printEstimatedTotalMinutes?: number;
   private lastNotifiedProgressBucket = -1;
@@ -356,82 +359,35 @@ export class BambuPrinterAccessory {
       .onGet(() => this.currentSpeedLevel * 25)
       .onSet((value) => this.setPrintSpeed(Math.round((value as number) / 25)));
 
-    // Countdown timer - uses the Valve service's RemainingDuration
-    // characteristic, which is a real HomeKit-native countdown display
-    // (originally designed for irrigation cycles), rather than a repurposed
-    // slider. Home app will show a generic valve/sprinkler-style icon for
-    // this tile - a cosmetic mismatch, but it's the only characteristic that
-    // gives an actual countdown UI. Default range caps at 3600s (1 hour, the
-    // normal irrigation use case) - extended here to 24h for multi-hour
-    // prints. Active/InUse are read-only display, reverting any manual
-    // toggle back to the real occupancy state, same pattern as Progress/Speed.
-    // Only created if progressDisplayMode includes "valve" (default "both").
-    if (progressMode === 'valve' || progressMode === 'both') {
+    // Countdown timer - LightSensor's CurrentAmbientLightLevel repurposed as
+    // MM.SS: whole-number part is minutes remaining, decimal part is seconds
+    // (e.g. 45.30 = 45m 30s). Ticks locally once per second between real
+    // mc_remaining_time updates (which only have minute precision) so it
+    // counts down smoothly rather than jumping once a minute - resynced to
+    // the real value whenever a fresh one arrives, so it can't drift far.
+    // Only created if progressDisplayMode includes "countdown" (default "both").
+    if (progressMode === 'countdown' || progressMode === 'both') {
       this.countdownService =
-        this.accessory.getServiceById(this.platform.Service.Valve, 'countdown') ||
-        this.accessory.addService(this.platform.Service.Valve, `${printerConfig.name} Time Remaining`, 'countdown');
-      const countdownService = this.countdownService;
-      countdownService.setCharacteristic(
-        this.platform.Characteristic.Name,
-        `${printerConfig.name} Time Remaining`,
-      );
-      countdownService.setCharacteristic(this.platform.Characteristic.ValveType, 0); // Generic Valve
-      countdownService
-        .getCharacteristic(this.platform.Characteristic.Active)
-        .onGet(() =>
-          this.currentlyOccupied
-            ? this.platform.Characteristic.Active.ACTIVE
-            : this.platform.Characteristic.Active.INACTIVE,
-        )
-        .onSet(() => {
-          setTimeout(
-            () =>
-              countdownService.updateCharacteristic(
-                this.platform.Characteristic.Active,
-                this.currentlyOccupied
-                  ? this.platform.Characteristic.Active.ACTIVE
-                  : this.platform.Characteristic.Active.INACTIVE,
-              ),
-            0,
-          );
-        });
-      countdownService
-        .getCharacteristic(this.platform.Characteristic.InUse)
-        .onGet(() =>
-          this.currentlyOccupied
-            ? this.platform.Characteristic.InUse.IN_USE
-            : this.platform.Characteristic.InUse.NOT_IN_USE,
+        this.accessory.getServiceById(this.platform.Service.LightSensor, 'countdown') ||
+        this.accessory.addService(
+          this.platform.Service.LightSensor,
+          `${printerConfig.name} Countdown`,
+          'countdown',
         );
+      const countdownService = this.countdownService;
+      countdownService.setCharacteristic(this.platform.Characteristic.Name, `${printerConfig.name} Countdown`);
       countdownService
-        .getCharacteristic(this.platform.Characteristic.RemainingDuration)
-        .setProps({ minValue: 0, maxValue: 86400 })
-        .onGet(() => this.remainingDurationSeconds);
-      // SetDuration (the total planned duration) alongside RemainingDuration -
-      // Home app's sprinkler-style UI typically renders a visual progress ring
-      // when both are present together. Read-only like everything else here:
-      // a real irrigation valve would START running for this long if you set
-      // it, which we never want, so any manual set reverts immediately.
-      countdownService
-        .getCharacteristic(this.platform.Characteristic.SetDuration)
-        .setProps({ minValue: 0, maxValue: 86400 })
-        .onGet(() => this.setDurationSeconds)
-        .onSet(() => {
-          setTimeout(
-            () =>
-              countdownService.updateCharacteristic(
-                this.platform.Characteristic.SetDuration,
-                this.setDurationSeconds,
-              ),
-            0,
-          );
-        });
+        .getCharacteristic(this.platform.Characteristic.CurrentAmbientLightLevel)
+        .setProps({ minValue: 0, maxValue: 2000, minStep: 0.01 })
+        .onGet(() => this.countdownLightSensorValue());
     } else {
-      // Mode is "fan" only - remove any previously-created Time Remaining
-      // valve so switching modes doesn't leave an orphaned tile behind.
-      const existing = this.accessory.getServiceById(this.platform.Service.Valve, 'countdown');
+      // Mode doesn't include "countdown" - remove any previously-created
+      // countdown light sensor so switching modes doesn't leave an orphan.
+      const existing = this.accessory.getServiceById(this.platform.Service.LightSensor, 'countdown');
       if (existing) {
         this.accessory.removeService(existing);
       }
+      this.stopCountdownTicker();
     }
 
     // Pause/Resume - a genuine two-state Switch (unlike Stop, this is safely
@@ -699,6 +655,38 @@ export class BambuPrinterAccessory {
     const names = ['', 'Silent', 'Standard', 'Sport', 'Ludicrous'];
     this.platform.log.info(`[${this.printerConfig.name}] Print speed -> ${names[level]}`);
     this.notifySpeedChange(level);
+
+    // Debounce: the printer's own status reports can briefly lag right after
+    // we send a command, still reflecting the old value for a moment before
+    // catching up. Without this, that lag gets misread as a genuine external
+    // change and fires its own (wrong) notification, which then "corrects"
+    // itself again once the real value arrives - the "100 -> 50 -> 100"
+    // pattern. Suppress reconciliation notifications for a cooldown window,
+    // then do exactly one check: if the printer settled on something other
+    // than what we asked for, that's a real correction worth notifying about.
+    const cooldownMs = 5000;
+    this.speedCommandCooldownUntil = Date.now() + cooldownMs;
+    if (this.speedCommandCorrectionTimer) {
+      clearTimeout(this.speedCommandCorrectionTimer);
+    }
+    this.speedCommandCorrectionTimer = setTimeout(() => {
+      this.speedCommandCorrectionTimer = undefined;
+      if (this.currentSpeedLevel !== level) {
+        this.platform.log.info(
+          `[${this.printerConfig.name}] Speed settled at ${names[this.currentSpeedLevel]}, ` +
+            `not the requested ${names[level]} - sending correction.`,
+        );
+        this.speedService.updateCharacteristic(
+          this.platform.Characteristic.RotationSpeed,
+          this.currentSpeedLevel * 25,
+        );
+        void this.sendPingieNotificationWithSnapshot(
+          '🚀 Speed changed',
+          `${this.printerConfig.name}: actually now ${names[this.currentSpeedLevel]} ` +
+            `(${this.currentSpeedLevel * 25}%) - requested ${names[level]} didn't stick.`,
+        );
+      }
+    }, cooldownMs);
   }
 
   private notifySpeedChange(level: number) {
@@ -956,14 +944,18 @@ export class BambuPrinterAccessory {
     }
   }
 
-  // Combines same-material entries and prices them via filamentPricesPerKg.
+  // Combines same-material entries and prices them via filamentPrices (an
+  // array of {material, pricePerKg} - not a plain object map, specifically so
+  // Homebridge UI's auto-generated form can render it as a normal editable
+  // list with an Add button, rather than needing the raw JSON editor).
   // A material with no configured price still reports its weight, just with
   // cost: undefined, and is excluded from the total rather than silently
   // treated as free.
   private estimateFilamentCost(
     entries: { type: string; grams: number }[],
   ): { totalCost: number; anyUnpriced: boolean; byMaterial: { type: string; grams: number; cost?: number }[] } {
-    const prices = this.printerConfig.filamentPricesPerKg ?? {};
+    const priceList = this.printerConfig.filamentPrices ?? [];
+    const prices = new Map(priceList.map((p) => [p.material, p.pricePerKg]));
     const byType = new Map<string, number>();
     for (const e of entries) {
       byType.set(e.type, (byType.get(e.type) ?? 0) + e.grams);
@@ -973,7 +965,7 @@ export class BambuPrinterAccessory {
     let anyUnpriced = false;
     const byMaterial: { type: string; grams: number; cost?: number }[] = [];
     for (const [type, grams] of byType) {
-      const pricePerKg = prices[type];
+      const pricePerKg = prices.get(type);
       const cost = pricePerKg !== undefined ? (grams / 1000) * pricePerKg : undefined;
       if (cost !== undefined) {
         totalCost += cost;
@@ -1147,7 +1139,7 @@ export class BambuPrinterAccessory {
     const iconUrl = overrideIconUrl ?? pingieIconUrl;
     try {
       const url =
-        `https://notifypush.pingie.com/notify-json/${encodeURIComponent(pingieGroupId)}` +
+        `https://push.getnotifyapp.com/notify-json/${encodeURIComponent(pingieGroupId)}` +
         `?token=${encodeURIComponent(pingieGroupToken)}`;
       const res = await fetch(url, {
         method: 'POST',
@@ -1680,8 +1672,7 @@ export class BambuPrinterAccessory {
       // notification below can't accidentally use last print's number.
       delete this.mergedState.mc_remaining_time;
       this.printEstimatedTotalMinutes = undefined;
-      this.setDurationSeconds = 0;
-      this.countdownService?.updateCharacteristic(this.platform.Characteristic.SetDuration, 0);
+      this.startCountdownTicker();
 
       this.platform.log.info(`[${this.printerConfig.name}] Print started.`);
       this.startedSwitchService.updateCharacteristic(
@@ -1701,13 +1692,6 @@ export class BambuPrinterAccessory {
         this.startNotificationTimer = undefined;
         const remaining = this.mergedState.mc_remaining_time as number | undefined;
         this.printEstimatedTotalMinutes = typeof remaining === 'number' && remaining > 0 ? remaining : undefined;
-        if (this.printEstimatedTotalMinutes) {
-          this.setDurationSeconds = Math.min(this.printEstimatedTotalMinutes * 60, 86400);
-          this.countdownService?.updateCharacteristic(
-            this.platform.Characteristic.SetDuration,
-            this.setDurationSeconds,
-          );
-        }
         const jobName = this.mergedState.subtask_name as string | undefined;
 
         const parts = jobName
@@ -1750,8 +1734,7 @@ export class BambuPrinterAccessory {
 
       this.printStartTimestamp = undefined;
       this.printEstimatedTotalMinutes = undefined;
-      this.setDurationSeconds = 0;
-      this.countdownService?.updateCharacteristic(this.platform.Characteristic.SetDuration, 0);
+      this.stopCountdownTicker();
     }
     this.previousGcodeState = gcodeState;
 
@@ -1797,7 +1780,11 @@ export class BambuPrinterAccessory {
     if (typeof spdLvl === 'number' && [1, 2, 3, 4].includes(spdLvl) && spdLvl !== this.currentSpeedLevel) {
       this.currentSpeedLevel = spdLvl;
       this.speedService.updateCharacteristic(this.platform.Characteristic.RotationSpeed, spdLvl * 25);
-      this.notifySpeedChange(spdLvl);
+      // Suppress the notification during the post-command cooldown - see
+      // setPrintSpeed for why. The slider still updates live either way.
+      if (Date.now() >= this.speedCommandCooldownUntil) {
+        this.notifySpeedChange(spdLvl);
+      }
     }
 
     const mcPercent = this.mergedState.mc_percent as number | undefined;
@@ -1835,19 +1822,49 @@ export class BambuPrinterAccessory {
       }
     }
 
-    // Countdown timer - RemainingDuration in seconds, mirrors occupancy for
-    // Active/InUse so the tile reads 0/"not in use" once printing stops.
+    // Countdown timer - resync the locally-ticking counter to the real
+    // mc_remaining_time whenever a fresh value arrives (minute precision from
+    // the printer), so the per-second local ticking can't drift far between
+    // updates.
     const remainingMinutes = this.mergedState.mc_remaining_time as number | undefined;
-    const remainingSeconds = occupied && typeof remainingMinutes === 'number' && remainingMinutes > 0
-      ? Math.min(remainingMinutes * 60, 86400)
-      : 0;
-    if (remainingSeconds !== this.remainingDurationSeconds) {
-      this.remainingDurationSeconds = remainingSeconds;
-      this.countdownService?.updateCharacteristic(
-        this.platform.Characteristic.RemainingDuration,
-        remainingSeconds,
-      );
+    if (occupied && typeof remainingMinutes === 'number' && remainingMinutes >= 0) {
+      this.countdownSecondsRemaining = Math.min(remainingMinutes * 60, 2000 * 60);
     }
+  }
+
+  private countdownLightSensorValue(): number {
+    const totalSeconds = Math.max(0, this.countdownSecondsRemaining);
+    const minutes = Math.floor(totalSeconds / 60);
+    const seconds = totalSeconds % 60;
+    // HAP light sensor values must be > 0 per spec convention - 0.0001 reads
+    // as "0m 00s" for practical purposes without violating that.
+    const value = minutes + seconds / 100;
+    return Math.max(0.0001, Math.round(value * 100) / 100);
+  }
+
+  private startCountdownTicker() {
+    this.stopCountdownTicker();
+    this.countdownTicker = setInterval(() => {
+      if (this.countdownSecondsRemaining > 0) {
+        this.countdownSecondsRemaining -= 1;
+      }
+      this.countdownService?.updateCharacteristic(
+        this.platform.Characteristic.CurrentAmbientLightLevel,
+        this.countdownLightSensorValue(),
+      );
+    }, 1000);
+  }
+
+  private stopCountdownTicker() {
+    if (this.countdownTicker) {
+      clearInterval(this.countdownTicker);
+      this.countdownTicker = undefined;
+    }
+    this.countdownSecondsRemaining = 0;
+    this.countdownService?.updateCharacteristic(
+      this.platform.Characteristic.CurrentAmbientLightLevel,
+      this.countdownLightSensorValue(),
+    );
   }
 
   public shutdown() {
@@ -1856,6 +1873,12 @@ export class BambuPrinterAccessory {
     }
     if (this.startNotificationTimer) {
       clearTimeout(this.startNotificationTimer);
+    }
+    if (this.countdownTicker) {
+      clearInterval(this.countdownTicker);
+    }
+    if (this.speedCommandCorrectionTimer) {
+      clearTimeout(this.speedCommandCorrectionTimer);
     }
     this.stopRefreshTimer();
     this.client?.end(true);
