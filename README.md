@@ -154,12 +154,12 @@ How it maps onto data we already track:
 - `endsIn` (seconds from now) is exactly `mc_remaining_time × 60` - iOS ticks
   the countdown locally after that with no further requests, refreshed on
   each progress update to stay accurate over a multi-hour print
-- `body` also shows speed (with an emoji per profile: 🐢 Silent, 🚶 Standard,
-  🏃 Sport, 🚀 Ludicrous), the print's material(s) (read from the sliced 3MF
-  at print start, alongside the preview thumbnail fetch - one shared FTP
-  download rather than two separate ones), and an estimated cost calculated
-  from the printer's own time estimate - e.g. `62% · 🚀 Ludicrous · PLA ·
-  Est. £0.16`
+- `body` also shows current layer (`Layer 186/299`, when available), speed
+  (with an emoji per profile: 🐢 Silent, 🚶 Standard, 🏃 Sport, 🚀 Ludicrous),
+  the print's material(s) (read from the sliced 3MF at print start, alongside
+  the preview thumbnail fetch - one shared FTP download rather than two
+  separate ones), and an estimated cost calculated from the printer's own
+  time estimate - e.g. `62% · Layer 186/299 · 🚀 Ludicrous · PLA · Est. £0.16`
 - The tile starts the moment printing begins (even before a time estimate
   exists - it just shows 0% until `endsIn` populates on the next update),
   updates every `liveActivityUpdateIntervalPercent` (default 1%, decoupled
@@ -207,6 +207,19 @@ correctly say "Paused," but the *countdown number itself* will keep visually
 ticking down through the pause regardless. On resume, a fresh `endsIn` is
 pushed from the printer's current `mc_remaining_time`, correcting for
 whatever drifted during the pause.
+
+**If you swipe the tile away mid-print, it auto-recovers.** Confirmed via
+real testing (not speculation): dismissing a Lock Screen Live Activity while
+its job is still running means the next plain update gets rejected by
+Pingie's API with `410 Gone` (`"The user dismissed this tile while its job
+was still running"`) - it does **not** just silently reappear on its own.
+The plugin detects this specific response and automatically retries with
+`new=1` to start a fresh tile (including a full title/symbol/tint, not just
+whatever partial fields that particular update happened to carry), so a
+dismissed tile self-heals on the next update rather than staying gone for
+the rest of the print. At the *end* of a print, if the tile was dismissed,
+the "end" call gets the same `410` and is treated as a benign no-op instead
+- no value in starting a fresh tile just to immediately close it.
 
 `liveActivitySymbol` (default `printer.fill`) and `liveActivityTint` (default
 `#FF6600`) control the tile's icon and accent color. `liveActivityKeepForSeconds`

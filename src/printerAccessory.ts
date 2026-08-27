@@ -1308,6 +1308,38 @@ export class BambuPrinterAccessory {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(fields),
       });
+      if (res.status === 410) {
+        // Confirmed via real testing: this means the user dismissed the tile
+        // from the Lock Screen while the print was still running, and Pingie
+        // requires an explicit new=1 to start a fresh one rather than
+        // silently reappearing on the next update. Self-heal automatically
+        // by retrying with a full tile (title/symbol/tint included) rather
+        // than just the partial fields this call happened to carry - a
+        // fresh tile needs those to render correctly, not just whatever this
+        // particular update was passing (e.g. a progress-only tick).
+        this.platform.log.info(
+          `[${this.printerConfig.name}] Live Activity was dismissed for device ${device.deviceId} - starting a fresh one.`,
+        );
+        const jobName = this.mergedState.subtask_name as string | undefined;
+        const freshUrl = `${url}&new=1`;
+        const freshRes = await fetch(freshUrl, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            title: jobName ? jobName.slice(0, 120) : this.printerConfig.name,
+            symbol: this.printerConfig.liveActivitySymbol ?? 'printer.fill',
+            tint: this.printerConfig.liveActivityTint ?? '#FF6600',
+            ...fields,
+          }),
+        });
+        if (!freshRes.ok) {
+          const freshBody = await freshRes.text().catch(() => '');
+          this.platform.log.warn(
+            `[${this.printerConfig.name}] Restarting the dismissed Live Activity failed for device ${device.deviceId} (${freshRes.status}): ${freshBody}`,
+          );
+        }
+        return;
+      }
       if (!res.ok) {
         const body = await res.text().catch(() => '');
         this.platform.log.warn(
@@ -1343,6 +1375,15 @@ export class BambuPrinterAccessory {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(body),
       });
+      if (res.status === 410) {
+        // Already dismissed by the user - nothing to end, and no value in
+        // starting a fresh tile just to immediately close it. Benign, not a
+        // real failure.
+        this.platform.log.info(
+          `[${this.printerConfig.name}] Live Activity for device ${device.deviceId} was already dismissed - nothing to end.`,
+        );
+        return;
+      }
       if (!res.ok) {
         const errBody = await res.text().catch(() => '');
         this.platform.log.warn(
@@ -1425,6 +1466,11 @@ export class BambuPrinterAccessory {
     // rendering of the numeric "progress" field includes a visible number
     // alongside the bar or just the bar itself.
     const parts = [`${this.printProgressPercent}%`];
+    const layerNum = this.mergedState.layer_num as number | undefined;
+    const totalLayerNum = this.mergedState.total_layer_num as number | undefined;
+    if (typeof layerNum === 'number' && typeof totalLayerNum === 'number' && totalLayerNum > 0) {
+      parts.push(`Layer ${layerNum}/${totalLayerNum}`);
+    }
     const speedEmoji = BambuPrinterAccessory.SPEED_EMOJIS[this.currentSpeedLevel] ?? '';
     const speedName = BambuPrinterAccessory.SPEED_NAMES[this.currentSpeedLevel] ?? '';
     parts.push(`${speedEmoji} ${speedName}`.trim());
