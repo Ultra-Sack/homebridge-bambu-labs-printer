@@ -146,16 +146,20 @@ device's ID and Token from the Notify! app's Devices tab on that device (not
 the Group ID/Token used for regular pushes).
 
 How it maps onto data we already track:
-- `progress` (0-100) is exactly `mc_percent`
+- `progress` (0-100) is exactly `mc_percent`, and is also included as explicit
+  text at the start of `body` (`62% · ...`) - not confirmed whether Pingie's
+  own rendering of the numeric `progress` field shows a visible number
+  alongside the bar or just the bar itself, so this guarantees it's readable
+  either way
 - `endsIn` (seconds from now) is exactly `mc_remaining_time × 60` - iOS ticks
   the countdown locally after that with no further requests, refreshed on
   each progress update to stay accurate over a multi-hour print
-- `body` shows speed (with an emoji per profile: 🐢 Silent, 🚶 Standard,
+- `body` also shows speed (with an emoji per profile: 🐢 Silent, 🚶 Standard,
   🏃 Sport, 🚀 Ludicrous), the print's material(s) (read from the sliced 3MF
   at print start, alongside the preview thumbnail fetch - one shared FTP
   download rather than two separate ones), and an estimated cost calculated
-  from the printer's own time estimate - e.g. `🚀 Ludicrous · PLA · Est.
-  £0.16`
+  from the printer's own time estimate - e.g. `62% · 🚀 Ludicrous · PLA ·
+  Est. £0.16`
 - The tile starts the moment printing begins (even before a time estimate
   exists - it just shows 0% until `endsIn` populates on the next update),
   updates every `liveActivityUpdateIntervalPercent` (default 1%, decoupled

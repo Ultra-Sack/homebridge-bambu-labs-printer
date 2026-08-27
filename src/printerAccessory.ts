@@ -1416,9 +1416,18 @@ export class BambuPrinterAccessory {
   // refresh triggered on a speed change (see setPrintSpeed and the spd_lvl
   // reconciliation block).
   private buildLiveActivityBodyLine(): string {
+    // printProgressPercent already tracks the real current percentage
+    // continuously (same field driving the Progress fan), independent of the
+    // Live Activity's own throttled update interval - referencing it
+    // directly here means the body text always reflects the true current
+    // percent even between throttled tile updates. Included as explicit text
+    // as a guarantee, since it's not confirmed whether Pingie's own
+    // rendering of the numeric "progress" field includes a visible number
+    // alongside the bar or just the bar itself.
+    const parts = [`${this.printProgressPercent}%`];
     const speedEmoji = BambuPrinterAccessory.SPEED_EMOJIS[this.currentSpeedLevel] ?? '';
     const speedName = BambuPrinterAccessory.SPEED_NAMES[this.currentSpeedLevel] ?? '';
-    const parts = [`${speedEmoji} ${speedName}`.trim()];
+    parts.push(`${speedEmoji} ${speedName}`.trim());
     if (this.currentPrintMaterials) {
       parts.push(this.currentPrintMaterials);
     }
