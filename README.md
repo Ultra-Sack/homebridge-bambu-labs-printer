@@ -56,10 +56,12 @@ Exposes a Bambu Lab printer to HomeKit as:
   real `mc_remaining_time` updates (which only have minute precision from the
   printer), resyncing to the real value whenever a fresh one arrives so it
   can't drift far - gives a smoothly counting-down display rather than one
-  that jumps once a minute. **Untested display precision:** Home app's own
-  lux formatting may not show two decimal places consistently, which could
-  make single-digit seconds (e.g. `45.06`) round or truncate unpredictably -
-  worth checking directly once deployed. **Configurable via
+  that jumps once a minute. **Pauses correctly**: the local per-second tick
+  stops while the printer is paused, rather than continuing to drain time
+  that isn't actually elapsing. **Untested display precision:** Home app's
+  own lux formatting may not show two decimal places consistently, which
+  could make single-digit seconds (e.g. `45.06`) round or truncate
+  unpredictably - worth checking directly once deployed. **Configurable via
   `progressDisplayMode`** (default `"both"`) - set to `"fan"` to hide this
   one. Switching either mode automatically removes the tile(s) no longer in
   use rather than leaving an orphan behind.
@@ -132,22 +134,75 @@ notifications with a single **persistent, updating Lock Screen tile** instead
 notifications," which is exactly what it does here.
 
 **Important: this needs a different credential than everything else in this
-config.** Live Activities are a per-*device* Pingie feature, not per-group -
-get a **Device ID and Device Token** from the Notify! app's Devices tab (not
-the Group ID/Token used for regular pushes) and put them in `pingieDeviceId`
-/ `pingieDeviceToken`.
+config, and Pingie has no group support for it at all.** Live Activities are
+a per-*device* Pingie feature - confirmed directly from their API docs, the
+`/live-activity/{id}` endpoint only accepts a device ID or a specific
+`activityId`, no `GRP*` auto-detection the way the regular notification
+endpoint has. **To show the tile on more than one phone, add one entry per
+device to `liveActivityDevices`** - the plugin sends a separate update to
+each device listed, achieving multi-device support itself even though
+Pingie's own API has no native concept of it for this feature. Get each
+device's ID and Token from the Notify! app's Devices tab on that device (not
+the Group ID/Token used for regular pushes).
 
 How it maps onto data we already track:
 - `progress` (0-100) is exactly `mc_percent`
 - `endsIn` (seconds from now) is exactly `mc_remaining_time × 60` - iOS ticks
   the countdown locally after that with no further requests, refreshed on
   each progress update to stay accurate over a multi-hour print
+- `body` shows speed (with an emoji per profile: 🐢 Silent, 🚶 Standard,
+  🏃 Sport, 🚀 Ludicrous), the print's material(s) (read from the sliced 3MF
+  at print start, alongside the preview thumbnail fetch - one shared FTP
+  download rather than two separate ones), and an estimated cost calculated
+  from the printer's own time estimate - e.g. `🚀 Ludicrous · PLA · Est.
+  £0.16`
 - The tile starts the moment printing begins (even before a time estimate
   exists - it just shows 0% until `endsIn` populates on the next update),
-  updates on the same interval as `progressNotificationIntervalPercent`, and
+  updates every `liveActivityUpdateIntervalPercent` (default 1%, decoupled
+  from `progressNotificationIntervalPercent` - Live Activity updates are
+  lightweight, so there's no real reason to throttle them the same way a
+  burst of push notifications needs to be), and
   ends automatically at Finish (`status: "done"`, showing the total cost as
   the tile's final trailing text if filament/electricity pricing is
   configured) or at a failed/cancelled print (`status: "failed"`)
+- **The tile itself now starts earlier than `RUNNING`** - at the moment
+  `occupied` first becomes true, which (with the default `activeStates`
+  including `PREPARE`) is right when heating/leveling begins, not once actual
+  printing starts. This is specifically what makes the next point possible.
+- **Bed/nozzle heating updates the tile's body** (`🌡️ Heating bed: 24°C →
+  60°C`) instead of sending a separate push, since the tile now exists by the
+  time these fire. Reverts to the standard body line on the next regular
+  progress update. If you've customized `activeStates` to exclude `PREPARE`,
+  the tile won't exist yet during heating for your setup, and this falls back
+  to a regular push automatically - not a bug, just nothing to encapsulate
+  into in that configuration.
+- **A speed change triggers an immediate out-of-cycle update** (not waiting
+  for the next 1% tick) - both `body` (new speed) and a fresh
+  `requestFullState()` call to prompt the printer for an updated
+  `mc_remaining_time` sooner, since a speed change can meaningfully shift how
+  long is actually left. Applies whether the change came from HomeKit or was
+  detected externally (touchscreen/app).
+- **First layer check inspection also updates the tile's body** (`👁️
+  Inspecting first layer`) instead of sending a separate push, while a print
+  using the Live Activity is active - reverts to the standard body line on
+  the next regular progress update.
+
+**One thing still deliberately sends as a separate push even in Live
+Activity mode, for an architectural reason rather than oversight: AMS
+Auto-Dry** (enabled/disabled, started/stopped) - drying isn't tied to an
+active print at all; it can run with the printer completely idle. Folding it
+into a print's Live Activity would mean inconsistent behaviour depending on
+unrelated print state, so it stays separate regardless of this setting.
+
+**Pausing pushes an explicit `status: "paused"` update immediately, with a
+real platform limitation worth knowing:** once `endsIn` is set, iOS ticks that
+countdown down in real wall-clock time on its own, independent of whether we
+send further updates - this is fundamental ActivityKit behaviour, not
+something a plugin-side fix can prevent. So the tile's *status text* will
+correctly say "Paused," but the *countdown number itself* will keep visually
+ticking down through the pause regardless. On resume, a fresh `endsIn` is
+pushed from the printer's current `mc_remaining_time`, correcting for
+whatever drifted during the pause.
 
 `liveActivitySymbol` (default `printer.fill`) and `liveActivityTint` (default
 `#FF6600`) control the tile's icon and accent color. `liveActivityKeepForSeconds`

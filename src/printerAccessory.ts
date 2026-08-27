@@ -42,11 +42,20 @@ export interface PrinterConfig {
   // per-DEVICE feature, not per-group - needs a separate device ID/token
   // from the Notify! app, distinct from pingieGroupId/pingieGroupToken.
   useLiveActivity?: boolean;
-  pingieDeviceId?: string;
-  pingieDeviceToken?: string;
+  // Pingie's Live Activity API has no group concept at all - the endpoint
+  // only accepts a device ID or a specific activityId, no GRP* auto-detection
+  // the way the regular /notify-json endpoint has. To show the tile on
+  // multiple devices, the plugin makes one separate call per device rather
+  // than relying on anything server-side to fan it out.
+  liveActivityDevices?: Array<{ deviceId: string; deviceToken: string }>;
   liveActivitySymbol?: string; // SF Symbol name, e.g. "printer.fill"
   liveActivityTint?: string; // "#RRGGBB"
   liveActivityKeepForSeconds?: number; // how long the finished tile lingers
+  // Decoupled from progressNotificationIntervalPercent - Live Activity
+  // updates are cheap/lightweight compared to a burst of push notifications,
+  // so there's no real reason to throttle it the same way. Defaults to 1
+  // (update on every percent change) for a smoothly progressing tile.
+  liveActivityUpdateIntervalPercent?: number;
   // Diagnostic-only, off by default to keep MQTT traffic minimal. Subscribes
   // to the /request topic to sniff commands sent by other clients (Bambu
   // Studio's native buttons) - only useful while actively hunting for
@@ -180,6 +189,8 @@ export class BambuPrinterAccessory {
   private printProgressPercent = 0;
   private countdownSecondsRemaining = 0;
   private currentPrintThumbnailUrl?: string;
+  private currentPrintMaterials?: string;
+  private cachedFilamentUsage?: { type: string; grams: number }[];
   private countdownTicker?: ReturnType<typeof setInterval>;
   // 1=Silent, 2=Standard, 3=Sport, 4=Ludicrous. Tracked optimistically from
   // our own commands; also reconciled against the printer's own spd_lvl
@@ -191,6 +202,7 @@ export class BambuPrinterAccessory {
   private printStartTimestamp?: number;
   private printEstimatedTotalMinutes?: number;
   private lastNotifiedProgressBucket = -1;
+  private lastNotifiedLiveActivityBucket = -1;
   private cameraUiToken?: string;
   private cameraUiTokenExpiresAt = 0;
   private startNotificationTimer?: ReturnType<typeof setTimeout>;
@@ -600,6 +612,8 @@ export class BambuPrinterAccessory {
   // Fault sensor/alarm notification - handled as its own separate, non-alarming
   // notification instead.
   private static readonly FIRST_LAYER_CHECK_HMS_CODE = '0C00-0300-0003-000B';
+  private static readonly SPEED_NAMES = ['', 'Silent', 'Standard', 'Sport', 'Ludicrous'];
+  private static readonly SPEED_EMOJIS = ['', '🐢', '🚶', '🏃', '🚀'];
 
   // Decodes an hms entry's attr/code fields into Bambu's own 4-part display
   // code format - confirmed correct against a real touchscreen error
@@ -672,7 +686,7 @@ export class BambuPrinterAccessory {
     });
     this.client.publish(`device/${this.printerConfig.serialNumber}/request`, payload);
     this.currentSpeedLevel = level; // optimistic; reconciled against spd_lvl if/when it arrives
-    const names = ['', 'Silent', 'Standard', 'Sport', 'Ludicrous'];
+    const names = BambuPrinterAccessory.SPEED_NAMES;
     this.platform.log.info(`[${this.printerConfig.name}] Print speed -> ${names[level]}`);
     this.notifySpeedChange(level);
 
@@ -700,21 +714,43 @@ export class BambuPrinterAccessory {
           this.platform.Characteristic.RotationSpeed,
           this.currentSpeedLevel * 25,
         );
-        void this.sendPingieNotificationWithSnapshot(
-          '🚀 Speed changed',
-          `${this.printerConfig.name}: actually now ${names[this.currentSpeedLevel]} ` +
-            `(${this.currentSpeedLevel * 25}%) - requested ${names[level]} didn't stick.`,
-        );
+        if (this.printerConfig.useLiveActivity && this.currentlyOccupied) {
+          this.requestFullState();
+          void this.updateLiveActivity({ body: this.buildLiveActivityBodyLine() });
+        } else {
+          void this.sendPingieNotificationWithSnapshot(
+            '🚀 Speed changed',
+            `${this.printerConfig.name}: actually now ${names[this.currentSpeedLevel]} ` +
+              `(${this.currentSpeedLevel * 25}%) - requested ${names[level]} didn't stick.`,
+          );
+        }
       }
     }, cooldownMs);
   }
 
+  // Routes through the Live Activity (immediate body/progress refresh, no
+  // separate push) when one is active for the current print, falling back to
+  // the regular push notification otherwise - e.g. not currently printing,
+  // or useLiveActivity is off.
   private notifySpeedChange(level: number) {
-    const names = ['', 'Silent', 'Standard', 'Sport', 'Ludicrous'];
-    void this.sendPingieNotificationWithSnapshot(
-      '🚀 Speed changed',
-      `${this.printerConfig.name}: now ${names[level]} (${level * 25}%).`,
-    );
+    const names = BambuPrinterAccessory.SPEED_NAMES;
+    if (this.printerConfig.useLiveActivity && this.currentlyOccupied) {
+      // Also request a fresh full state immediately - a speed change can
+      // meaningfully shift mc_remaining_time, and waiting for the printer's
+      // own next natural report would otherwise leave the countdown stale
+      // until whatever it next decides to send.
+      this.requestFullState();
+      const remaining = this.mergedState.mc_remaining_time as number | undefined;
+      void this.updateLiveActivity({
+        body: this.buildLiveActivityBodyLine(),
+        endsIn: typeof remaining === 'number' && remaining >= 0 ? remaining * 60 : undefined,
+      });
+    } else {
+      void this.sendPingieNotificationWithSnapshot(
+        '🚀 Speed changed',
+        `${this.printerConfig.name}: now ${names[level]} (${level * 25}%).`,
+      );
+    }
   }
 
   // Sends the reverse-engineered AMS drying command. temp/cooling_temp are
@@ -918,13 +954,11 @@ export class BambuPrinterAccessory {
     return { buffer: fileBuffer, path: usedPath };
   }
 
-  private async fetchFilamentUsage(): Promise<{ type: string; grams: number }[] | undefined> {
-    const downloaded = await this.downloadProjectFile();
-    if (!downloaded) {
-      return undefined;
-    }
-    const { buffer: fileBuffer } = downloaded;
-
+  // Parses filament type/weight entries out of an already-downloaded 3MF
+  // buffer - split out from fetchFilamentUsage so both the finish-time cost
+  // calculation and the print-start material caching can share it without a
+  // second FTP round-trip.
+  private parseFilamentEntriesFromBuffer(fileBuffer: Buffer): { type: string; grams: number }[] | undefined {
     try {
       const zip = new AdmZip(fileBuffer);
       const entry =
@@ -974,6 +1008,14 @@ export class BambuPrinterAccessory {
       );
       return undefined;
     }
+  }
+
+  private async fetchFilamentUsage(): Promise<{ type: string; grams: number }[] | undefined> {
+    const downloaded = await this.downloadProjectFile();
+    if (!downloaded) {
+      return undefined;
+    }
+    return this.parseFilamentEntriesFromBuffer(downloaded.buffer);
   }
 
   // Combines same-material entries and prices them via filamentPrices (an
@@ -1121,18 +1163,34 @@ export class BambuPrinterAccessory {
     return this.sendPingieNotification(title, text, snapshotUrl);
   }
 
-  // Extracts the slicer-rendered plate preview (the same thumbnail the
-  // touchscreen shows when browsing files) from the sliced 3MF and uploads it
-  // to GitHub, caching the resulting URL for reuse across every notification
-  // for this print rather than re-fetching over FTP each time. Called once
-  // per print, fire-and-forget - a failure here never blocks notifications,
-  // they just fall back to the camera snapshot (if enabled) or plain text.
-  private async fetchAndCachePrintThumbnail() {
-    if (!this.printerConfig.includePrintPreviewImage) {
-      return;
+  // Fetches the project file once at print start and extracts everything we
+  // need from it in one pass: the thumbnail (if includePrintPreviewImage),
+  // and the material list (for the Live Activity body and, cached here,
+  // reused at finish time instead of a second FTP round-trip for the
+  // filament cost calculation). Fire-and-forget - a failure here never
+  // blocks notifications or the finish-time cost calc, which falls back to
+  // its own fresh fetch if this cache came up empty.
+  private async fetchAndCacheProjectData() {
+    const needsThumbnail = Boolean(this.printerConfig.includePrintPreviewImage);
+    const needsMaterials = Boolean(this.printerConfig.useLiveActivity);
+    if (!needsThumbnail && !needsMaterials) {
+      return; // nothing would use the data - skip the FTP fetch entirely
     }
     const downloaded = await this.downloadProjectFile();
     if (!downloaded) {
+      return;
+    }
+
+    // Materials - cached for both the live Live Activity body and reused at
+    // finish time so sendFinishedNotifications doesn't need its own fetch.
+    const filamentEntries = this.parseFilamentEntriesFromBuffer(downloaded.buffer);
+    if (filamentEntries) {
+      this.cachedFilamentUsage = filamentEntries;
+      const uniqueMaterials = [...new Set(filamentEntries.map((f) => f.type))];
+      this.currentPrintMaterials = uniqueMaterials.join('/');
+    }
+
+    if (!needsThumbnail) {
       return;
     }
     try {
@@ -1168,7 +1226,9 @@ export class BambuPrinterAccessory {
   private async sendFinishedNotifications(elapsedMinutes: number | undefined) {
     const electricityCost = elapsedMinutes !== undefined ? this.estimateCost(elapsedMinutes) : undefined;
 
-    const filamentUsage = await this.fetchFilamentUsage();
+    // Reuse the material list already fetched at print start, if available,
+    // rather than a second FTP round-trip for the same data.
+    const filamentUsage = this.cachedFilamentUsage ?? (await this.fetchFilamentUsage());
     const filamentInfo = filamentUsage ? this.estimateFilamentCost(filamentUsage) : undefined;
 
     // 1. Combined total.
@@ -1232,13 +1292,17 @@ export class BambuPrinterAccessory {
     trailing?: string;
     status?: string;
   }) {
-    const { pingieDeviceId, pingieDeviceToken } = this.printerConfig;
-    if (!pingieDeviceId || !pingieDeviceToken) {
-      return;
-    }
+    const devices = this.printerConfig.liveActivityDevices ?? [];
+    await Promise.all(devices.map((device) => this.updateLiveActivityForDevice(device, fields)));
+  }
+
+  private async updateLiveActivityForDevice(
+    device: { deviceId: string; deviceToken: string },
+    fields: Record<string, unknown>,
+  ) {
     try {
-      const url = `https://push.getnotifyapp.com/live-activity/${encodeURIComponent(pingieDeviceId)}` +
-        `?token=${encodeURIComponent(pingieDeviceToken)}`;
+      const url = `https://push.getnotifyapp.com/live-activity/${encodeURIComponent(device.deviceId)}` +
+        `?token=${encodeURIComponent(device.deviceToken)}`;
       const res = await fetch(url, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -1246,39 +1310,49 @@ export class BambuPrinterAccessory {
       });
       if (!res.ok) {
         const body = await res.text().catch(() => '');
-        this.platform.log.warn(`[${this.printerConfig.name}] Live Activity update failed (${res.status}): ${body}`);
+        this.platform.log.warn(
+          `[${this.printerConfig.name}] Live Activity update failed for device ${device.deviceId} (${res.status}): ${body}`,
+        );
       }
     } catch (err) {
-      this.platform.log.warn(`[${this.printerConfig.name}] Live Activity update error: ${(err as Error).message}`);
+      this.platform.log.warn(
+        `[${this.printerConfig.name}] Live Activity update error for device ${device.deviceId}: ${(err as Error).message}`,
+      );
     }
   }
 
-  // Ends the tile. Always called with final content so the last thing shown
-  // isn't a frozen mid-progress state - per Pingie's own docs, forgetting
-  // this is the most commonly missed step and leaves a stale tile for up to
-  // 4 hours.
+  // Ends the tile on every configured device. Always called with final
+  // content so the last thing shown isn't a frozen mid-progress state - per
+  // Pingie's own docs, forgetting this is the most commonly missed step and
+  // leaves a stale tile for up to 4 hours.
   private async endLiveActivity(fields: { progress?: number; status?: string; trailing?: string }) {
-    const { pingieDeviceId, pingieDeviceToken } = this.printerConfig;
-    if (!pingieDeviceId || !pingieDeviceToken) {
-      return;
-    }
+    const devices = this.printerConfig.liveActivityDevices ?? [];
+    const body = { keepFor: this.printerConfig.liveActivityKeepForSeconds ?? 300, ...fields };
+    await Promise.all(devices.map((device) => this.endLiveActivityForDevice(device, body)));
+  }
+
+  private async endLiveActivityForDevice(
+    device: { deviceId: string; deviceToken: string },
+    body: Record<string, unknown>,
+  ) {
     try {
-      const url = `https://push.getnotifyapp.com/live-activity/${encodeURIComponent(pingieDeviceId)}` +
-        `?token=${encodeURIComponent(pingieDeviceToken)}`;
+      const url = `https://push.getnotifyapp.com/live-activity/${encodeURIComponent(device.deviceId)}` +
+        `?token=${encodeURIComponent(device.deviceToken)}`;
       const res = await fetch(url, {
         method: 'DELETE',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          keepFor: this.printerConfig.liveActivityKeepForSeconds ?? 300,
-          ...fields,
-        }),
+        body: JSON.stringify(body),
       });
       if (!res.ok) {
-        const body = await res.text().catch(() => '');
-        this.platform.log.warn(`[${this.printerConfig.name}] Live Activity end failed (${res.status}): ${body}`);
+        const errBody = await res.text().catch(() => '');
+        this.platform.log.warn(
+          `[${this.printerConfig.name}] Live Activity end failed for device ${device.deviceId} (${res.status}): ${errBody}`,
+        );
       }
     } catch (err) {
-      this.platform.log.warn(`[${this.printerConfig.name}] Live Activity end error: ${(err as Error).message}`);
+      this.platform.log.warn(
+        `[${this.printerConfig.name}] Live Activity end error for device ${device.deviceId}: ${(err as Error).message}`,
+      );
     }
   }
 
@@ -1333,6 +1407,26 @@ export class BambuPrinterAccessory {
     }
     const kwh = (averagePrintWattage / 1000) * (minutes / 60);
     return (kwh * electricityRatePencePerKwh) / 100;
+  }
+
+  // Composes the Live Activity's standard body line: speed (with emoji),
+  // material, estimated cost. Used for every regular progress update; the
+  // speed portion is what makes a speed change visible immediately rather
+  // than waiting for the next progress tick, once paired with the immediate
+  // refresh triggered on a speed change (see setPrintSpeed and the spd_lvl
+  // reconciliation block).
+  private buildLiveActivityBodyLine(): string {
+    const speedEmoji = BambuPrinterAccessory.SPEED_EMOJIS[this.currentSpeedLevel] ?? '';
+    const speedName = BambuPrinterAccessory.SPEED_NAMES[this.currentSpeedLevel] ?? '';
+    const parts = [`${speedEmoji} ${speedName}`.trim()];
+    if (this.currentPrintMaterials) {
+      parts.push(this.currentPrintMaterials);
+    }
+    const cost = this.printEstimatedTotalMinutes ? this.estimateCost(this.printEstimatedTotalMinutes) : undefined;
+    if (cost !== undefined) {
+      parts.push(`Est. £${cost.toFixed(2)}`);
+    }
+    return parts.join(' · ');
   }
 
   private connect() {
@@ -1608,6 +1702,27 @@ export class BambuPrinterAccessory {
     if (pausedNow !== this.currentlyPaused) {
       this.currentlyPaused = pausedNow;
       this.pauseService.updateCharacteristic(this.platform.Characteristic.On, pausedNow);
+
+      // Live Activity: push an explicit status change immediately on
+      // pause/resume. Important limitation worth knowing - iOS ticks a Live
+      // Activity's countdown down in real wall-clock time once endsIn is
+      // set, independent of whether we send further updates, so the timer
+      // visual itself will keep counting down through a pause regardless of
+      // this - this only fixes the status text, not that platform behaviour.
+      // On resume, a fresh endsIn is pushed from the printer's own current
+      // mc_remaining_time to correct for whatever drifted during the pause.
+      if (this.printerConfig.useLiveActivity) {
+        if (pausedNow) {
+          void this.updateLiveActivity({ status: 'paused' });
+        } else {
+          const remaining = this.mergedState.mc_remaining_time as number | undefined;
+          void this.updateLiveActivity({
+            status: 'printing',
+            endsIn: typeof remaining === 'number' && remaining >= 0 ? remaining * 60 : undefined,
+            body: this.buildLiveActivityBodyLine(),
+          });
+        }
+      }
     }
 
     // Preheating notifications - fires once when bed/nozzle actually starts
@@ -1622,10 +1737,16 @@ export class BambuPrinterAccessory {
     if (!Number.isNaN(bedCurrent) && !Number.isNaN(bedTarget)) {
       const bedHeatingNow = bedTarget > 0 && bedCurrent < bedTarget - HEATING_MARGIN_C;
       if (bedHeatingNow && !this.bedHeatingActive) {
-        void this.sendPingieNotificationWithSnapshot(
-          '🌡️ Bed heating',
-          `${this.printerConfig.name}: ${bedCurrent.toFixed(0)}°C → ${bedTarget.toFixed(0)}°C.`,
-        );
+        if (this.printerConfig.useLiveActivity && this.currentlyOccupied) {
+          void this.updateLiveActivity({
+            body: `🌡️ Heating bed: ${bedCurrent.toFixed(0)}°C → ${bedTarget.toFixed(0)}°C`,
+          });
+        } else {
+          void this.sendPingieNotificationWithSnapshot(
+            '🌡️ Bed heating',
+            `${this.printerConfig.name}: ${bedCurrent.toFixed(0)}°C → ${bedTarget.toFixed(0)}°C.`,
+          );
+        }
       }
       this.bedHeatingActive = bedHeatingNow;
     }
@@ -1637,10 +1758,16 @@ export class BambuPrinterAccessory {
     if (!Number.isNaN(nozzleCurrent) && !Number.isNaN(nozzleTarget)) {
       const nozzleHeatingNow = nozzleTarget > 0 && nozzleCurrent < nozzleTarget - HEATING_MARGIN_C;
       if (nozzleHeatingNow && !this.nozzleHeatingActive) {
-        void this.sendPingieNotificationWithSnapshot(
-          '🌡️ Nozzle heating',
-          `${this.printerConfig.name}: ${nozzleCurrent.toFixed(0)}°C → ${nozzleTarget.toFixed(0)}°C.`,
-        );
+        if (this.printerConfig.useLiveActivity && this.currentlyOccupied) {
+          void this.updateLiveActivity({
+            body: `🌡️ Heating nozzle: ${nozzleCurrent.toFixed(0)}°C → ${nozzleTarget.toFixed(0)}°C`,
+          });
+        } else {
+          void this.sendPingieNotificationWithSnapshot(
+            '🌡️ Nozzle heating',
+            `${this.printerConfig.name}: ${nozzleCurrent.toFixed(0)}°C → ${nozzleTarget.toFixed(0)}°C.`,
+          );
+        }
       }
       this.nozzleHeatingActive = nozzleHeatingNow;
     }
@@ -1737,10 +1864,14 @@ export class BambuPrinterAccessory {
     if (firstLayerCheckActive !== this.firstLayerCheckActive) {
       this.firstLayerCheckActive = firstLayerCheckActive;
       if (firstLayerCheckActive) {
-        void this.sendPingieNotificationWithSnapshot(
-          '👁️ First layer check',
-          `${this.printerConfig.name} is inspecting the first layer.`,
-        );
+        if (this.printerConfig.useLiveActivity && this.currentlyOccupied) {
+          void this.updateLiveActivity({ body: '👁️ Inspecting first layer' });
+        } else {
+          void this.sendPingieNotificationWithSnapshot(
+            '👁️ First layer check',
+            `${this.printerConfig.name} is inspecting the first layer.`,
+          );
+        }
       }
     }
 
@@ -1819,12 +1950,15 @@ export class BambuPrinterAccessory {
     if (gcodeState === 'RUNNING' && this.previousGcodeState !== 'RUNNING' && this.previousGcodeState !== 'PAUSE') {
       this.printStartTimestamp = Date.now();
       this.lastNotifiedProgressBucket = -1;
+      this.lastNotifiedLiveActivityBucket = -1;
       // Clear any stale estimate left over from a previous print so the delayed
       // notification below can't accidentally use last print's number.
       delete this.mergedState.mc_remaining_time;
       this.printEstimatedTotalMinutes = undefined;
       this.startCountdownTicker();
       this.currentPrintThumbnailUrl = undefined;
+      this.currentPrintMaterials = undefined;
+      this.cachedFilamentUsage = undefined;
 
       this.platform.log.info(`[${this.printerConfig.name}] Print started.`);
       this.startedSwitchService.updateCharacteristic(
@@ -1832,18 +1966,16 @@ export class BambuPrinterAccessory {
         this.platform.Characteristic.ProgrammableSwitchEvent.SINGLE_PRESS,
       );
 
-      // Live Activity mode: start the tile right away, even before a time
-      // estimate exists - it can show progress=0 and pick up endsIn on the
-      // next update once mc_remaining_time populates. Skips the regular push
-      // notification stack entirely when this mode is on, per the whole
-      // point of a Live Activity - one persistent tile, not a burst of pushes.
+      // Live Activity: the tile itself was already started earlier, at the
+      // occupied-transition (PREPARE), so heating notifications could be
+      // encapsulated into it. This just refreshes title (subtask_name may
+      // only just now be populated) and flips status from "preparing" to
+      // "printing" now that actual printing has begun. Skips the regular
+      // push notification stack entirely when this mode is on either way.
       if (this.printerConfig.useLiveActivity) {
         const jobName = this.mergedState.subtask_name as string | undefined;
         void this.updateLiveActivity({
           title: jobName ? jobName.slice(0, 120) : this.printerConfig.name,
-          symbol: this.printerConfig.liveActivitySymbol ?? 'printer.fill',
-          tint: this.printerConfig.liveActivityTint ?? '#FF6600',
-          progress: 0,
           status: 'printing',
         });
       }
@@ -1864,7 +1996,7 @@ export class BambuPrinterAccessory {
         // Awaited (not fire-and-forget) so the very first "Print started" push
         // already has the image ready, rather than racing it and only later
         // notifications picking it up once the fetch/upload finishes.
-        await this.fetchAndCachePrintThumbnail();
+        await this.fetchAndCacheProjectData();
 
         const parts = jobName
           ? [`Print started on ${this.printerConfig.name}: "${jobName}".`]
@@ -1885,9 +2017,11 @@ export class BambuPrinterAccessory {
 
         if (this.printerConfig.useLiveActivity) {
           // Update the tile with the countdown now that it's available,
-          // instead of sending the regular push.
+          // instead of sending the regular push. body now has real material
+          // data since fetchAndCacheProjectData just resolved above.
           void this.updateLiveActivity({
             endsIn: this.printEstimatedTotalMinutes ? this.printEstimatedTotalMinutes * 60 : undefined,
+            body: this.buildLiveActivityBodyLine(),
           });
         } else {
           void this.sendPingieNotificationWithSnapshot('🖨️ Print started', parts.join(' '));
@@ -1981,6 +2115,26 @@ export class BambuPrinterAccessory {
           ? this.platform.Characteristic.InUse.IN_USE
           : this.platform.Characteristic.InUse.NOT_IN_USE,
       );
+
+      // Live Activity: start here, not at the RUNNING transition further
+      // below - activeStates includes PREPARE by default, so "occupied"
+      // already goes true right when heating/leveling begins. Starting the
+      // tile this early (rather than waiting for RUNNING) is what makes it
+      // possible to encapsulate bed/nozzle heating notifications into the
+      // tile instead of sending them separately - there's now a tile to
+      // update by the time those fire. The RUNNING-gated block further below
+      // just updates this same tile (title/status) once printing properly
+      // begins, rather than creating a second one.
+      if (occupied && this.printerConfig.useLiveActivity) {
+        const jobName = this.mergedState.subtask_name as string | undefined;
+        void this.updateLiveActivity({
+          title: jobName ? jobName.slice(0, 120) : this.printerConfig.name,
+          symbol: this.printerConfig.liveActivitySymbol ?? 'printer.fill',
+          tint: this.printerConfig.liveActivityTint ?? '#FF6600',
+          progress: 0,
+          status: 'preparing',
+        });
+      }
     }
 
     // Reconcile speed level against the printer's own report if it's present
@@ -2009,21 +2163,31 @@ export class BambuPrinterAccessory {
         );
       }
 
-      const interval = this.printerConfig.progressNotificationIntervalPercent ?? 5;
-      if (interval > 0 && occupied) {
-        const bucket = Math.floor(clamped / interval) * interval;
-        if (bucket > this.lastNotifiedProgressBucket && bucket > 0) {
-          this.lastNotifiedProgressBucket = bucket;
-          const remaining = this.mergedState.mc_remaining_time as number | undefined;
-
-          if (this.printerConfig.useLiveActivity) {
+      if (this.printerConfig.useLiveActivity) {
+        // Decoupled interval - see liveActivityUpdateIntervalPercent comment
+        // in the config interface for why this isn't throttled the same as
+        // push notifications.
+        const laInterval = this.printerConfig.liveActivityUpdateIntervalPercent ?? 1;
+        if (laInterval > 0 && occupied) {
+          const laBucket = Math.floor(clamped / laInterval) * laInterval;
+          if (laBucket > this.lastNotifiedLiveActivityBucket && laBucket > 0) {
+            this.lastNotifiedLiveActivityBucket = laBucket;
+            const remaining = this.mergedState.mc_remaining_time as number | undefined;
             void this.updateLiveActivity({
-              progress: bucket,
-              endsIn:
-                typeof remaining === 'number' && remaining >= 0 ? remaining * 60 : undefined,
+              progress: laBucket,
+              endsIn: typeof remaining === 'number' && remaining >= 0 ? remaining * 60 : undefined,
               status: 'printing',
+              body: this.buildLiveActivityBodyLine(),
             });
-          } else {
+          }
+        }
+      } else {
+        const interval = this.printerConfig.progressNotificationIntervalPercent ?? 5;
+        if (interval > 0 && occupied) {
+          const bucket = Math.floor(clamped / interval) * interval;
+          if (bucket > this.lastNotifiedProgressBucket && bucket > 0) {
+            this.lastNotifiedProgressBucket = bucket;
+            const remaining = this.mergedState.mc_remaining_time as number | undefined;
             const remainingText =
               typeof remaining === 'number' && remaining >= 0
                 ? `${this.formatDuration(remaining)} remaining`
@@ -2066,7 +2230,11 @@ export class BambuPrinterAccessory {
   private startCountdownTicker() {
     this.stopCountdownTicker();
     this.countdownTicker = setInterval(() => {
-      if (this.countdownSecondsRemaining > 0) {
+      // Don't decrement while paused - nothing is actually elapsing print-wise,
+      // and without this the countdown drifts wrong for the whole pause
+      // duration with no correction (the printer may not send fresh
+      // mc_remaining_time updates while paused either).
+      if (!this.currentlyPaused && this.countdownSecondsRemaining > 0) {
         this.countdownSecondsRemaining -= 1;
       }
       this.countdownService?.updateCharacteristic(

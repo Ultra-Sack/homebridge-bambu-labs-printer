@@ -96,16 +96,27 @@
               "title": "Use a Live Activity instead of Started/Progress/Finished pushes",
               "type": "boolean",
               "default": false,
-              "description": "One persistent, updating Lock Screen tile instead of a burst of separate notifications. Requires pingieDeviceId/pingieDeviceToken below - this is a per-device Pingie feature, a different credential from the group ID/token used for regular pushes. Filament cost and Electricity cost notifications still send separately either way."
+              "description": "One persistent, updating Lock Screen tile instead of a burst of separate notifications. Requires at least one entry in liveActivityDevices below - this is a per-device Pingie feature, a different credential from the group ID/token used for regular pushes. Filament cost and Electricity cost notifications still send separately either way."
             },
-            "pingieDeviceId": {
-              "title": "Pingie Device ID (for Live Activities)",
-              "type": "string",
-              "description": "From the Notify! app - Devices tab, not the Group ID used elsewhere in this config."
-            },
-            "pingieDeviceToken": {
-              "title": "Pingie Device Token (for Live Activities)",
-              "type": "string"
+            "liveActivityDevices": {
+              "title": "Live Activity Devices",
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "deviceId": {
+                    "title": "Device ID",
+                    "type": "string",
+                    "description": "From the Notify! app's Devices tab on that device, not the Group ID used elsewhere in this config."
+                  },
+                  "deviceToken": {
+                    "title": "Device Token",
+                    "type": "string"
+                  }
+                },
+                "required": ["deviceId", "deviceToken"]
+              },
+              "description": "Add one row per device you want the Live Activity tile to appear on. Pingie's Live Activity API has no group concept - the plugin sends one separate update to each device listed here, so the tile can appear on multiple phones even though Pingie itself only supports addressing a single device per call."
             },
             "liveActivitySymbol": {
               "title": "Live Activity Icon (SF Symbol name)",
@@ -122,6 +133,12 @@
               "type": "number",
               "default": 300,
               "description": "How long the completed tile stays visible before clearing. 0 clears immediately."
+            },
+            "liveActivityUpdateIntervalPercent": {
+              "title": "Live Activity Update Interval (%)",
+              "type": "number",
+              "default": 1,
+              "description": "Decoupled from the push-notification interval below - Live Activity updates are lightweight, so there's no real reason to throttle it the same way. Default updates on every 1% for a smoothly progressing tile."
             },
             "enableRequestTopicSniffing": {
               "title": "Enable AMS ID sniffer (diagnostic, off by default)",
