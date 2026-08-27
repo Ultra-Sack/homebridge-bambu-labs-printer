@@ -92,6 +92,37 @@
               "default": 5,
               "description": "Sends a \"check the printer\" push after this many consecutive failed reconnect attempts, then again every that-many attempts while it stays down. Set to 0 to disable."
             },
+            "useLiveActivity": {
+              "title": "Use a Live Activity instead of Started/Progress/Finished pushes",
+              "type": "boolean",
+              "default": false,
+              "description": "One persistent, updating Lock Screen tile instead of a burst of separate notifications. Requires pingieDeviceId/pingieDeviceToken below - this is a per-device Pingie feature, a different credential from the group ID/token used for regular pushes. Filament cost and Electricity cost notifications still send separately either way."
+            },
+            "pingieDeviceId": {
+              "title": "Pingie Device ID (for Live Activities)",
+              "type": "string",
+              "description": "From the Notify! app - Devices tab, not the Group ID used elsewhere in this config."
+            },
+            "pingieDeviceToken": {
+              "title": "Pingie Device Token (for Live Activities)",
+              "type": "string"
+            },
+            "liveActivitySymbol": {
+              "title": "Live Activity Icon (SF Symbol name)",
+              "type": "string",
+              "default": "printer.fill"
+            },
+            "liveActivityTint": {
+              "title": "Live Activity Accent Color",
+              "type": "string",
+              "default": "#FF6600"
+            },
+            "liveActivityKeepForSeconds": {
+              "title": "Finished Tile Lingers For (seconds)",
+              "type": "number",
+              "default": 300,
+              "description": "How long the completed tile stays visible before clearing. 0 clears immediately."
+            },
             "enableRequestTopicSniffing": {
               "title": "Enable AMS ID sniffer (diagnostic, off by default)",
               "type": "boolean",
@@ -266,6 +297,18 @@
               "type": "string",
               "default": "images/latest-print.jpg",
               "description": "This one file gets overwritten each time, rather than accumulating a new file per notification."
+            },
+            "includePrintPreviewImage": {
+              "title": "Use the sliced file's rendered preview as the notification icon",
+              "type": "boolean",
+              "default": false,
+              "description": "Extracts the slicer-rendered plate thumbnail from the sliced 3MF (same image the touchscreen shows) via FTP - not the camera. Preferred over the camera snapshot if both are enabled. Not usable with Live Activities (SF Symbol icon only, no custom image support). Uses the same GitHub fields above."
+            },
+            "githubPreviewImagePath": {
+              "title": "Preview Image File Path in Repo",
+              "type": "string",
+              "default": "images/latest-print-preview.png",
+              "description": "Separate file from the camera snapshot path above, so the two features don't overwrite each other if both are ever enabled."
             },
             "githubBranch": {
               "title": "GitHub Branch",

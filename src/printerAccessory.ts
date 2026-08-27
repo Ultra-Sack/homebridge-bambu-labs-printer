@@ -35,6 +35,18 @@ export interface PrinterConfig {
   // stays down, so a lost connection doesn't just go silent. Set to 0 to
   // disable. Defaults to 5.
   mqttReconnectAlertThreshold?: number;
+
+  // Live Activities (Pingie's Lock Screen tile feature) - opt-in, off by
+  // default. Replaces the Started/Progress/Finished push notification stack
+  // with one persistent, updating tile instead. IMPORTANT: this is a
+  // per-DEVICE feature, not per-group - needs a separate device ID/token
+  // from the Notify! app, distinct from pingieGroupId/pingieGroupToken.
+  useLiveActivity?: boolean;
+  pingieDeviceId?: string;
+  pingieDeviceToken?: string;
+  liveActivitySymbol?: string; // SF Symbol name, e.g. "printer.fill"
+  liveActivityTint?: string; // "#RRGGBB"
+  liveActivityKeepForSeconds?: number; // how long the finished tile lingers
   // Diagnostic-only, off by default to keep MQTT traffic minimal. Subscribes
   // to the /request topic to sniff commands sent by other clients (Bambu
   // Studio's native buttons) - only useful while actively hunting for
@@ -85,6 +97,13 @@ export interface PrinterConfig {
   githubOwner?: string;
   githubRepo?: string;
   githubSnapshotPath?: string;
+  // Print preview thumbnail - the slicer-rendered plate image embedded in the
+  // sliced 3MF (the same one the touchscreen shows browsing files), extracted
+  // via the FTP connection already used for filament weight, not the camera.
+  // Preferred over includeCameraSnapshot when both are enabled. Not usable
+  // with Live Activities - that API only supports SF Symbols, no custom image.
+  includePrintPreviewImage?: boolean;
+  githubPreviewImagePath?: string;
   githubBranch?: string;
 
   // Price per kg by material type (e.g. {"PLA": 18.99, "PETG": 22.99}), used
@@ -160,6 +179,7 @@ export class BambuPrinterAccessory {
   private previousGcodeState?: string;
   private printProgressPercent = 0;
   private countdownSecondsRemaining = 0;
+  private currentPrintThumbnailUrl?: string;
   private countdownTicker?: ReturnType<typeof setInterval>;
   // 1=Silent, 2=Standard, 3=Sport, 4=Ludicrous. Tracked optimistically from
   // our own commands; also reconciled against the printer's own spd_lvl
@@ -837,7 +857,10 @@ export class BambuPrinterAccessory {
   // internal path and XML attribute names aren't independently verified here,
   // so on any mismatch this logs the raw content it found rather than
   // guessing - check the log and adjust if your Studio version differs.
-  private async fetchFilamentUsage(): Promise<{ type: string; grams: number }[] | undefined> {
+  // Shared FTP fetch of the current project's sliced .3mf file - used by both
+  // filament weight parsing and print preview thumbnail extraction, so
+  // there's one connection-handling path rather than two copies of it.
+  private async downloadProjectFile(): Promise<{ buffer: Buffer; path: string } | undefined> {
     const subtaskNameRaw = this.mergedState.subtask_name as string | undefined;
     if (!subtaskNameRaw) {
       this.platform.log.warn(`[${this.printerConfig.name}] No subtask_name available - can't locate the project file.`);
@@ -892,6 +915,15 @@ export class BambuPrinterAccessory {
       return undefined;
     }
     this.platform.log.info(`[${this.printerConfig.name}] Fetched project file from ${usedPath}`);
+    return { buffer: fileBuffer, path: usedPath };
+  }
+
+  private async fetchFilamentUsage(): Promise<{ type: string; grams: number }[] | undefined> {
+    const downloaded = await this.downloadProjectFile();
+    if (!downloaded) {
+      return undefined;
+    }
+    const { buffer: fileBuffer } = downloaded;
 
     try {
       const zip = new AdmZip(fileBuffer);
@@ -1021,12 +1053,11 @@ export class BambuPrinterAccessory {
   // each time rather than accumulating a new file per notification. Returns a
   // raw.githubusercontent.com URL with a cache-busting timestamp, or undefined
   // on any failure.
-  private async uploadSnapshotToGithub(jpeg: Buffer): Promise<string | undefined> {
+  private async uploadImageToGithub(image: Buffer, path: string): Promise<string | undefined> {
     const { githubToken, githubOwner, githubRepo } = this.printerConfig;
     if (!githubToken || !githubOwner || !githubRepo) {
       return undefined;
     }
-    const path = this.printerConfig.githubSnapshotPath ?? 'images/latest-print.jpg';
     const branch = this.printerConfig.githubBranch ?? 'main';
     const apiUrl = `https://api.github.com/repos/${githubOwner}/${githubRepo}/contents/${path}`;
     const headers = {
@@ -1047,8 +1078,8 @@ export class BambuPrinterAccessory {
         method: 'PUT',
         headers: { ...headers, 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          message: `Update print snapshot (${new Date().toISOString()})`,
-          content: jpeg.toString('base64'),
+          message: `Update ${path} (${new Date().toISOString()})`,
+          content: image.toString('base64'),
           branch,
           ...(sha ? { sha } : {}),
         }),
@@ -1057,7 +1088,7 @@ export class BambuPrinterAccessory {
       if (!putRes.ok) {
         const errBody = await putRes.text().catch(() => '');
         this.platform.log.warn(
-          `[${this.printerConfig.name}] GitHub snapshot upload failed (${putRes.status}): ${errBody}`,
+          `[${this.printerConfig.name}] GitHub image upload failed (${putRes.status}) for ${path}: ${errBody}`,
         );
         return undefined;
       }
@@ -1065,22 +1096,69 @@ export class BambuPrinterAccessory {
       return `https://raw.githubusercontent.com/${githubOwner}/${githubRepo}/${branch}/${path}?t=${Date.now()}`;
     } catch (err) {
       this.platform.log.warn(
-        `[${this.printerConfig.name}] GitHub snapshot upload error: ${(err as Error).message}`,
+        `[${this.printerConfig.name}] GitHub image upload error: ${(err as Error).message}`,
       );
       return undefined;
     }
   }
 
-  // Wraps sendPingieNotification with an optional live snapshot as the icon.
-  // Falls back to a plain text-only notification if capture/upload fails or
-  // includeCameraSnapshot isn't enabled - never blocks the underlying alert.
+  // Wraps sendPingieNotification with an image as the icon, preferring a
+  // cached print-preview render (extracted from the sliced 3MF, if enabled
+  // and already fetched for this print) over a live camera.ui snapshot.
+  // Falls back to a plain text-only notification if neither is available -
+  // never blocks the underlying alert.
   private async sendPingieNotificationWithSnapshot(title: string, text: string) {
+    if (this.printerConfig.includePrintPreviewImage && this.currentPrintThumbnailUrl) {
+      return this.sendPingieNotification(title, text, this.currentPrintThumbnailUrl);
+    }
     if (!this.printerConfig.includeCameraSnapshot) {
       return this.sendPingieNotification(title, text);
     }
     const jpeg = await this.captureSnapshotFromCameraUi();
-    const snapshotUrl = jpeg ? await this.uploadSnapshotToGithub(jpeg) : undefined;
+    const snapshotUrl = jpeg
+      ? await this.uploadImageToGithub(jpeg, this.printerConfig.githubSnapshotPath ?? 'images/latest-print.jpg')
+      : undefined;
     return this.sendPingieNotification(title, text, snapshotUrl);
+  }
+
+  // Extracts the slicer-rendered plate preview (the same thumbnail the
+  // touchscreen shows when browsing files) from the sliced 3MF and uploads it
+  // to GitHub, caching the resulting URL for reuse across every notification
+  // for this print rather than re-fetching over FTP each time. Called once
+  // per print, fire-and-forget - a failure here never blocks notifications,
+  // they just fall back to the camera snapshot (if enabled) or plain text.
+  private async fetchAndCachePrintThumbnail() {
+    if (!this.printerConfig.includePrintPreviewImage) {
+      return;
+    }
+    const downloaded = await this.downloadProjectFile();
+    if (!downloaded) {
+      return;
+    }
+    try {
+      const zip = new AdmZip(downloaded.buffer);
+      const entries = zip.getEntries();
+      const entry =
+        entries.find((e) => /^Metadata\/plate_\d+_small\.png$/i.test(e.entryName)) ??
+        entries.find((e) => /^Metadata\/plate_\d+\.png$/i.test(e.entryName));
+      if (!entry) {
+        this.platform.log.warn(
+          `[${this.printerConfig.name}] No plate preview PNG found in the 3MF for the print thumbnail. Entries: ` +
+            entries.map((e) => e.entryName).join(', '),
+        );
+        return;
+      }
+      const png = entry.getData();
+      const path = this.printerConfig.githubPreviewImagePath ?? 'images/latest-print-preview.png';
+      this.currentPrintThumbnailUrl = await this.uploadImageToGithub(png, path);
+      if (this.currentPrintThumbnailUrl) {
+        this.platform.log.info(`[${this.printerConfig.name}] Cached print preview thumbnail from ${entry.entryName}.`);
+      }
+    } catch (err) {
+      this.platform.log.warn(
+        `[${this.printerConfig.name}] Failed to extract print preview thumbnail: ${(err as Error).message}`,
+      );
+    }
   }
 
   // Sends the three finish-time notifications in order: combined total,
@@ -1105,7 +1183,15 @@ export class BambuPrinterAccessory {
     if (filamentInfo || electricityCost !== undefined) {
       combinedParts.push(`Total cost: £${combinedTotal.toFixed(2)}` + (filamentInfo?.anyUnpriced ? ' (some materials unpriced)' : '') + '.');
     }
-    await this.sendPingieNotificationWithSnapshot('✅ Print finished', combinedParts.join(' '));
+    if (this.printerConfig.useLiveActivity) {
+      await this.endLiveActivity({
+        progress: 100,
+        status: 'done',
+        trailing: (filamentInfo || electricityCost !== undefined) ? `£${combinedTotal.toFixed(2)}` : undefined,
+      });
+    } else {
+      await this.sendPingieNotificationWithSnapshot('✅ Print finished', combinedParts.join(' '));
+    }
 
     // 2. Filament breakdown, per material - only sent if we actually got data.
     if (filamentInfo && filamentInfo.byMaterial.length > 0) {
@@ -1128,6 +1214,71 @@ export class BambuPrinterAccessory {
         `${this.printerConfig.name}: ${elapsedMinutes ? this.formatDuration(elapsedMinutes) + ', ' : ''}` +
           `estimated £${electricityCost.toFixed(2)}.`,
       );
+    }
+  }
+
+  // Sends a Live Activity start/update. The device-address URL is an upsert
+  // per Pingie's docs: the first call starts the tile, every later call to
+  // the same URL updates it - no activityId tracking needed on our side,
+  // which also makes this naturally resilient to a Homebridge restart
+  // mid-print (nothing in-memory to lose).
+  private async updateLiveActivity(fields: {
+    title?: string;
+    body?: string;
+    symbol?: string;
+    tint?: string;
+    progress?: number;
+    endsIn?: number;
+    trailing?: string;
+    status?: string;
+  }) {
+    const { pingieDeviceId, pingieDeviceToken } = this.printerConfig;
+    if (!pingieDeviceId || !pingieDeviceToken) {
+      return;
+    }
+    try {
+      const url = `https://push.getnotifyapp.com/live-activity/${encodeURIComponent(pingieDeviceId)}` +
+        `?token=${encodeURIComponent(pingieDeviceToken)}`;
+      const res = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(fields),
+      });
+      if (!res.ok) {
+        const body = await res.text().catch(() => '');
+        this.platform.log.warn(`[${this.printerConfig.name}] Live Activity update failed (${res.status}): ${body}`);
+      }
+    } catch (err) {
+      this.platform.log.warn(`[${this.printerConfig.name}] Live Activity update error: ${(err as Error).message}`);
+    }
+  }
+
+  // Ends the tile. Always called with final content so the last thing shown
+  // isn't a frozen mid-progress state - per Pingie's own docs, forgetting
+  // this is the most commonly missed step and leaves a stale tile for up to
+  // 4 hours.
+  private async endLiveActivity(fields: { progress?: number; status?: string; trailing?: string }) {
+    const { pingieDeviceId, pingieDeviceToken } = this.printerConfig;
+    if (!pingieDeviceId || !pingieDeviceToken) {
+      return;
+    }
+    try {
+      const url = `https://push.getnotifyapp.com/live-activity/${encodeURIComponent(pingieDeviceId)}` +
+        `?token=${encodeURIComponent(pingieDeviceToken)}`;
+      const res = await fetch(url, {
+        method: 'DELETE',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          keepFor: this.printerConfig.liveActivityKeepForSeconds ?? 300,
+          ...fields,
+        }),
+      });
+      if (!res.ok) {
+        const body = await res.text().catch(() => '');
+        this.platform.log.warn(`[${this.printerConfig.name}] Live Activity end failed (${res.status}): ${body}`);
+      }
+    } catch (err) {
+      this.platform.log.warn(`[${this.printerConfig.name}] Live Activity end error: ${(err as Error).message}`);
     }
   }
 
@@ -1673,12 +1824,29 @@ export class BambuPrinterAccessory {
       delete this.mergedState.mc_remaining_time;
       this.printEstimatedTotalMinutes = undefined;
       this.startCountdownTicker();
+      this.currentPrintThumbnailUrl = undefined;
 
       this.platform.log.info(`[${this.printerConfig.name}] Print started.`);
       this.startedSwitchService.updateCharacteristic(
         this.platform.Characteristic.ProgrammableSwitchEvent,
         this.platform.Characteristic.ProgrammableSwitchEvent.SINGLE_PRESS,
       );
+
+      // Live Activity mode: start the tile right away, even before a time
+      // estimate exists - it can show progress=0 and pick up endsIn on the
+      // next update once mc_remaining_time populates. Skips the regular push
+      // notification stack entirely when this mode is on, per the whole
+      // point of a Live Activity - one persistent tile, not a burst of pushes.
+      if (this.printerConfig.useLiveActivity) {
+        const jobName = this.mergedState.subtask_name as string | undefined;
+        void this.updateLiveActivity({
+          title: jobName ? jobName.slice(0, 120) : this.printerConfig.name,
+          symbol: this.printerConfig.liveActivitySymbol ?? 'printer.fill',
+          tint: this.printerConfig.liveActivityTint ?? '#FF6600',
+          progress: 0,
+          status: 'printing',
+        });
+      }
 
       // Delay the Pingie push (not the HomeKit switch above, which fires
       // instantly) so mc_remaining_time has a real chance to populate with
@@ -1688,11 +1856,15 @@ export class BambuPrinterAccessory {
         clearTimeout(this.startNotificationTimer);
       }
       const delaySeconds = this.printerConfig.startNotificationDelaySeconds ?? 30;
-      this.startNotificationTimer = setTimeout(() => {
+      this.startNotificationTimer = setTimeout(async () => {
         this.startNotificationTimer = undefined;
         const remaining = this.mergedState.mc_remaining_time as number | undefined;
         this.printEstimatedTotalMinutes = typeof remaining === 'number' && remaining > 0 ? remaining : undefined;
         const jobName = this.mergedState.subtask_name as string | undefined;
+        // Awaited (not fire-and-forget) so the very first "Print started" push
+        // already has the image ready, rather than racing it and only later
+        // notifications picking it up once the fetch/upload finishes.
+        await this.fetchAndCachePrintThumbnail();
 
         const parts = jobName
           ? [`Print started on ${this.printerConfig.name}: "${jobName}".`]
@@ -1710,7 +1882,16 @@ export class BambuPrinterAccessory {
         } else {
           parts.push("No time estimate available from the printer yet - check the app for progress.");
         }
-        void this.sendPingieNotificationWithSnapshot('🖨️ Print started', parts.join(' '));
+
+        if (this.printerConfig.useLiveActivity) {
+          // Update the tile with the countdown now that it's available,
+          // instead of sending the regular push.
+          void this.updateLiveActivity({
+            endsIn: this.printEstimatedTotalMinutes ? this.printEstimatedTotalMinutes * 60 : undefined,
+          });
+        } else {
+          void this.sendPingieNotificationWithSnapshot('🖨️ Print started', parts.join(' '));
+        }
       }, delaySeconds * 1000);
     }
 
@@ -1731,6 +1912,36 @@ export class BambuPrinterAccessory {
       );
 
       void this.sendFinishedNotifications(elapsedMinutes);
+
+      this.printStartTimestamp = undefined;
+      this.printEstimatedTotalMinutes = undefined;
+      this.stopCountdownTicker();
+    }
+
+    // Print-failed handling - a failed/cancelled print never reaches FINISH,
+    // so without this nothing would clean up: timers keep running, and with
+    // Live Activities the tile would stay stuck showing stale progress for
+    // up to Apple's 8-hour cap. Pre-existing gap, not new to this feature -
+    // worth fixing regardless of whether Live Activities are in use.
+    if (gcodeState === 'FAILED' && this.previousGcodeState !== 'FAILED') {
+      const elapsedMinutes = this.printStartTimestamp
+        ? (Date.now() - this.printStartTimestamp) / 60_000
+        : undefined;
+
+      this.platform.log.info(
+        `[${this.printerConfig.name}] Print failed/cancelled` +
+          (elapsedMinutes ? ` - after ${this.formatDuration(elapsedMinutes)}` : ''),
+      );
+
+      if (this.printerConfig.useLiveActivity) {
+        void this.endLiveActivity({ status: 'failed' });
+      } else {
+        void this.sendPingieNotificationWithSnapshot(
+          '❌ Print failed',
+          `${this.printerConfig.name}: print stopped/failed` +
+            (elapsedMinutes ? ` after ${this.formatDuration(elapsedMinutes)}` : '') + '.',
+        );
+      }
 
       this.printStartTimestamp = undefined;
       this.printEstimatedTotalMinutes = undefined;
@@ -1804,20 +2015,30 @@ export class BambuPrinterAccessory {
         if (bucket > this.lastNotifiedProgressBucket && bucket > 0) {
           this.lastNotifiedProgressBucket = bucket;
           const remaining = this.mergedState.mc_remaining_time as number | undefined;
-          const remainingText =
-            typeof remaining === 'number' && remaining >= 0
-              ? `${this.formatDuration(remaining)} remaining`
-              : 'time remaining not available yet';
-          const layerNum = this.mergedState.layer_num as number | undefined;
-          const totalLayerNum = this.mergedState.total_layer_num as number | undefined;
-          const layerText =
-            typeof layerNum === 'number' && typeof totalLayerNum === 'number' && totalLayerNum > 0
-              ? ` Layer ${layerNum}/${totalLayerNum}.`
-              : '';
-          void this.sendPingieNotificationWithSnapshot(
-            '🖨️ Print progress',
-            `${this.printerConfig.name}: ${bucket}% complete - ${remainingText}.${layerText}`,
-          );
+
+          if (this.printerConfig.useLiveActivity) {
+            void this.updateLiveActivity({
+              progress: bucket,
+              endsIn:
+                typeof remaining === 'number' && remaining >= 0 ? remaining * 60 : undefined,
+              status: 'printing',
+            });
+          } else {
+            const remainingText =
+              typeof remaining === 'number' && remaining >= 0
+                ? `${this.formatDuration(remaining)} remaining`
+                : 'time remaining not available yet';
+            const layerNum = this.mergedState.layer_num as number | undefined;
+            const totalLayerNum = this.mergedState.total_layer_num as number | undefined;
+            const layerText =
+              typeof layerNum === 'number' && typeof totalLayerNum === 'number' && totalLayerNum > 0
+                ? ` Layer ${layerNum}/${totalLayerNum}.`
+                : '';
+            void this.sendPingieNotificationWithSnapshot(
+              '🖨️ Print progress',
+              `${this.printerConfig.name}: ${bucket}% complete - ${remainingText}.${layerText}`,
+            );
+          }
         }
       }
     }

@@ -122,6 +122,43 @@ to tell apart at a glance:
 | Filament run-out | 🧵⚠️ Filament run-out |
 | Connection lost | ⚠️ Connection lost (after N failed reconnects, configurable) |
 | Connection restored | ✅ Connection restored |
+| Print failed/cancelled | ❌ Print failed |
+
+## Live Activities (Lock Screen tile) instead of push notifications
+
+Setting `useLiveActivity: true` replaces the Started/Progress/Finished push
+notifications with a single **persistent, updating Lock Screen tile** instead
+- Pingie's own pitch for this is literally "one tile instead of a stack of
+notifications," which is exactly what it does here.
+
+**Important: this needs a different credential than everything else in this
+config.** Live Activities are a per-*device* Pingie feature, not per-group -
+get a **Device ID and Device Token** from the Notify! app's Devices tab (not
+the Group ID/Token used for regular pushes) and put them in `pingieDeviceId`
+/ `pingieDeviceToken`.
+
+How it maps onto data we already track:
+- `progress` (0-100) is exactly `mc_percent`
+- `endsIn` (seconds from now) is exactly `mc_remaining_time × 60` - iOS ticks
+  the countdown locally after that with no further requests, refreshed on
+  each progress update to stay accurate over a multi-hour print
+- The tile starts the moment printing begins (even before a time estimate
+  exists - it just shows 0% until `endsIn` populates on the next update),
+  updates on the same interval as `progressNotificationIntervalPercent`, and
+  ends automatically at Finish (`status: "done"`, showing the total cost as
+  the tile's final trailing text if filament/electricity pricing is
+  configured) or at a failed/cancelled print (`status: "failed"`)
+
+`liveActivitySymbol` (default `printer.fill`) and `liveActivityTint` (default
+`#FF6600`) control the tile's icon and accent color. `liveActivityKeepForSeconds`
+(default 300) controls how long the finished tile lingers before clearing -
+Pingie's own docs specifically warn that forgetting to end a tile explicitly
+leaves it stuck for up to 4 hours, which this plugin always does correctly on
+your behalf.
+
+**Filament cost and Electricity cost notifications still send as regular
+pushes either way** - they're separate detail breakdowns that don't map
+cleanly onto a single tile's content, so they're unaffected by this setting.
 
 ## Electricity cost estimates
 
@@ -332,6 +369,34 @@ Bambu Lab documentation, and it has known gaps** - some codes genuinely aren't
 in it yet (see [this open issue](https://github.com/greghesp/ha-bambulab/issues/525)
 for an example). When a code isn't found, the notification falls back to the
 raw numeric code instead of guessing.
+
+## Print preview image in notifications (rendered from the sliced file)
+
+Setting `includePrintPreviewImage: true` attaches the slicer-rendered plate
+preview - the same thumbnail image your printer's touchscreen shows when
+browsing files - as the notification icon. This is extracted directly from
+the sliced `.3mf` file's embedded `Metadata/plate_N_small.png` (falling back
+to the full-size `plate_N.png` if no small version exists) via the **same
+FTP connection already used for filament weight parsing** - not the camera,
+so none of the connection-contention concerns from the camera snapshot
+feature apply here. Fetched once per print (cached and reused across every
+notification for that print, not re-fetched each time) and uploaded to the
+same GitHub repo used for camera snapshots, via a separate file path so the
+two features don't collide if both are ever enabled.
+
+**Preferred over the camera snapshot** if both `includePrintPreviewImage` and
+`includeCameraSnapshot` are enabled - falls back to the camera snapshot (or
+plain text) only if the preview thumbnail isn't available for some reason
+(e.g. no `<filament>`/preview data in this particular file).
+
+**Not usable with Live Activities** - that API only supports an SF Symbol
+name for the tile's icon, not a custom image URL, so this setting has no
+effect while `useLiveActivity: true`.
+
+Verified end-to-end against a real sliced file: the exact regex used to find
+the thumbnail (`Metadata/plate_\d+_small\.png`) correctly matched
+`Metadata/plate_1_small.png` in a real Bambu Studio export, not just a
+plausible-looking guess.
 
 ## Live camera snapshots in notifications
 
