@@ -5,9 +5,14 @@ Exposes a Bambu Lab printer to HomeKit as:
 - An **Occupancy Sensor** — occupied while actively printing, clear when idle/finished.
   Intended for driving an automation that powers a smart plug off overnight once
   printing has stopped.
-- A **Lightbulb** — on/off control of the physical chamber LED strip, with state
-  read back from the printer so it stays in sync if changed from the touchscreen
-  or the Bambu app.
+- A **Lightbulb** (or **Switch**, via `lightAccessoryType: "switch"`) — on/off
+  control of the physical chamber LED strip, with state read back from the
+  printer so it stays in sync if changed from the touchscreen or the Bambu
+  app. Both service types share the exact same `On` characteristic, so
+  behavior is identical either way - the only difference is HomeKit category.
+  Worth switching to `"switch"` if you use Siri's "turn off all the lights" -
+  that command specifically targets the Lightbulb category, so it would
+  otherwise sweep up the chamber light mid-print along with your real lights.
 - A **Switch ("Pause")** — On while the printer is paused, Off while running;
   toggling it sends the `pause`/`resume` MQTT command. Stays in sync if paused or
   resumed from the touchscreen or app. (No "Stop"/cancel control - that's a
@@ -27,6 +32,24 @@ Exposes a Bambu Lab printer to HomeKit as:
   *off by default*, only appear if `showTemperatureSensors: true` is set.
   Ranges are extended beyond HomeKit's default 0-100°C cap (nozzle up to
   350°C, bed up to 150°C) so real readings don't get silently clipped.
+- A **Valve ("Air Purifier")** — *off by default*, only appears if
+  `enableAirPurifierSensor: true` is set. Goes active the moment a print
+  **finishes (or fails/cancels)** - not at print start - and automatically
+  clears itself after a configurable duration. Uses a Valve (not an Occupancy
+  Sensor) specifically because `SetDuration` is genuinely **adjustable
+  directly from the Home app** (a real +/- control on the accessory's detail
+  screen), not just via `airPurifierActiveDurationMinutes` in config -
+  adjusting it while the window is already running applies immediately as
+  "X minutes remaining from now." A new finish/fail resets the window rather
+  than letting an old one cut short a second back-to-back print's purifier
+  time. `Active`/`InUse`/`RemainingDuration` are computed/read-only and
+  revert any manual toggle; only `SetDuration` is meant to be changed by you.
+  If `useLiveActivity` is also on, the print's Live Activity tile extends
+  into a "purifying" phase (swapping to `liveActivityPurifierSymbol`, default
+  `aqi.medium` - confirmed to exist in Apple's SF Symbols catalogue, and a
+  distinct `liveActivityPurifierTint`, default `#0A84FF`) instead of ending
+  immediately at Finish - the tile's real end call is deferred until the
+  purifier window itself closes.
 - A **Switch ("AMS Auto-Dry")** — experimental, opt-in (only appears if `amsId`
   is configured). Enables/disables automatic threshold-based AMS 2 Pro drying -
   not a direct dryer toggle, and deliberately not a humidity sensor tile. See
@@ -151,15 +174,19 @@ How it maps onto data we already track:
   own rendering of the numeric `progress` field shows a visible number
   alongside the bar or just the bar itself, so this guarantees it's readable
   either way
+- `metrics` shows up to 6 labeled chips (Pingie's dashboard layout, confirmed
+  current via their own docs): PROGRESS (with a mini pill-bar, since it's a
+  percentage), LAYER, SPEED, MATERIAL, COST, ETA. `body` stays populated too
+  as the documented fallback for older app builds, in the same dense
+  single-line format as before (`62% · Layer 186/299 · 🚀 Ludicrous · PLA ·
+  Est. £0.16`) - modern app builds show the chips instead, since `metrics`
+  visually replaces the body text line. **Explicitly cleared to `null`**
+  during the transient status moments below (heating, first layer check,
+  purifying) so those messages are actually visible rather than buried under
+  stale chips - resumes on the next regular progress update.
 - `endsIn` (seconds from now) is exactly `mc_remaining_time × 60` - iOS ticks
   the countdown locally after that with no further requests, refreshed on
   each progress update to stay accurate over a multi-hour print
-- `body` also shows current layer (`Layer 186/299`, when available), speed
-  (with an emoji per profile: 🐢 Silent, 🚶 Standard, 🏃 Sport, 🚀 Ludicrous),
-  the print's material(s) (read from the sliced 3MF at print start, alongside
-  the preview thumbnail fetch - one shared FTP download rather than two
-  separate ones), and an estimated cost calculated from the printer's own
-  time estimate - e.g. `62% · Layer 186/299 · 🚀 Ludicrous · PLA · Est. £0.16`
 - The tile starts the moment printing begins (even before a time estimate
   exists - it just shows 0% until `endsIn` populates on the next update),
   updates every `liveActivityUpdateIntervalPercent` (default 1%, decoupled
@@ -190,6 +217,13 @@ How it maps onto data we already track:
   Inspecting first layer`) instead of sending a separate push, while a print
   using the Live Activity is active - reverts to the standard body line on
   the next regular progress update.
+- **`trailing` shows a clock-time ETA** (e.g. `22:23`) alongside the relative
+  countdown `endsIn` already provides - a fixed time-of-day estimate, not
+  just "how long from now." Switches to the final cost at Finish, same field
+  repurposed for its two sequential meanings.
+- **The icon swaps to `pause.fill` while paused**, back to the normal
+  printing symbol on resume - reinforces the pause status visually, not just
+  in the status text.
 
 **One thing still deliberately sends as a separate push even in Live
 Activity mode, for an architectural reason rather than oversight: AMS

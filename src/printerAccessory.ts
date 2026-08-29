@@ -133,6 +133,24 @@ export interface PrinterConfig {
   // public plugin doesn't clutter Home app with tiles most people won't want.
   showTemperatureSensors?: boolean;
 
+  // Chamber light as a Switch instead of a Lightbulb - Siri's "turn off all
+  // the lights" specifically targets the Lightbulb service category, so a
+  // Switch sidesteps getting swept up in that during an active print.
+  // Identical on/off behavior either way, since both service types share the
+  // same On characteristic.
+  lightAccessoryType?: 'lightbulb' | 'switch';
+
+  // Air purifier trigger - opt-in, off by default. A Valve service that goes
+  // active the moment a print FINISHES (or fails/cancels), staying active for
+  // a duration you can adjust directly from the Home app (SetDuration - a
+  // real settable characteristic, unlike Occupancy Sensor's fixed on/off).
+  // Active/InUse/RemainingDuration are computed/read-only; only SetDuration
+  // is genuinely user-controllable.
+  enableAirPurifierSensor?: boolean;
+  airPurifierActiveDurationMinutes?: number; // initial default for SetDuration, before any Home app adjustment
+  liveActivityPurifierSymbol?: string; // SF Symbol for the tile during the purifier phase - confirmed to exist (aqi.medium), unlike the earlier wind guess
+  liveActivityPurifierTint?: string; // distinct accent color for the purifying phase, so it's visually distinguishable from the printing phase at a glance
+
   // AMS 2 Pro remote drying control - opt-in, the switch/logic only gets
   // created if amsId is set. The drying MQTT command is reverse-engineered
   // (moderate-good confidence, confirmed by two independent sources), but
@@ -167,6 +185,11 @@ export class BambuPrinterAccessory {
   private bedTempService?: Service;
   private nozzleTempService?: Service;
   private chamberTempService?: Service;
+  private airPurifierSensorService?: Service;
+  private airPurifierActive = false;
+  private airPurifierTicker?: ReturnType<typeof setInterval>;
+  private airPurifierDurationMinutes?: number; // undefined = use config default; set once adjusted via Home app
+  private airPurifierSecondsRemaining = 0;
   private readonly pauseService: Service;
   private readonly startedSwitchService: Service;
   private readonly finishedSwitchService: Service;
@@ -241,6 +264,8 @@ export class BambuPrinterAccessory {
       this.platform.Service.ContactSensor.UUID,
       this.platform.Service.StatelessProgrammableSwitch.UUID,
       this.platform.Service.Switch.UUID,
+      this.platform.Service.OccupancySensor.UUID,
+      this.platform.Service.Lightbulb.UUID,
     ];
     for (const existing of [...this.accessory.services]) {
       if (typesToDeduplicate.includes(existing.UUID) && !existing.subtype) {
@@ -260,8 +285,8 @@ export class BambuPrinterAccessory {
     }
 
     this.service =
-      this.accessory.getService(this.platform.Service.OccupancySensor) ||
-      this.accessory.addService(this.platform.Service.OccupancySensor, printerConfig.name);
+      this.accessory.getServiceById(this.platform.Service.OccupancySensor, 'printing') ||
+      this.accessory.addService(this.platform.Service.OccupancySensor, printerConfig.name, 'printing');
 
     this.service.setCharacteristic(this.platform.Characteristic.Name, printerConfig.name);
 
@@ -282,10 +307,28 @@ export class BambuPrinterAccessory {
     this.service.updateCharacteristic(this.platform.Characteristic.StatusActive, false);
 
     // Chamber light - reads back real state from the printer's lights_report,
-    // and sends the on/off command over the same MQTT connection.
-    this.lightService =
-      this.accessory.getService(this.platform.Service.Lightbulb) ||
-      this.accessory.addService(this.platform.Service.Lightbulb, `${printerConfig.name} Light`);
+    // and sends the on/off command over the same MQTT connection. Exposed as
+    // either a Lightbulb (default) or a Switch, per lightAccessoryType - both
+    // share the identical On characteristic, so nothing else in this file
+    // needs to know or care which one is actually in use.
+    const wantSwitch = printerConfig.lightAccessoryType === 'switch';
+    if (wantSwitch) {
+      this.lightService =
+        this.accessory.getServiceById(this.platform.Service.Switch, 'light') ||
+        this.accessory.addService(this.platform.Service.Switch, `${printerConfig.name} Light`, 'light');
+      const orphan = this.accessory.getServiceById(this.platform.Service.Lightbulb, 'light');
+      if (orphan) {
+        this.accessory.removeService(orphan);
+      }
+    } else {
+      this.lightService =
+        this.accessory.getServiceById(this.platform.Service.Lightbulb, 'light') ||
+        this.accessory.addService(this.platform.Service.Lightbulb, `${printerConfig.name} Light`, 'light');
+      const orphan = this.accessory.getServiceById(this.platform.Service.Switch, 'light');
+      if (orphan) {
+        this.accessory.removeService(orphan);
+      }
+    }
 
     this.lightService.setCharacteristic(
       this.platform.Characteristic.Name,
@@ -502,6 +545,79 @@ export class BambuPrinterAccessory {
       this.chamberTempService
         .getCharacteristic(this.platform.Characteristic.CurrentTemperature)
         .setProps({ minValue: -20, maxValue: 100 });
+    }
+
+    // Air purifier trigger - opt-in, off by default. A Valve rather than an
+    // Occupancy Sensor specifically because SetDuration is genuinely
+    // user-settable from the Home app (a real +/- control on the Valve's
+    // detail screen), unlike anything Occupancy Sensor offers - this is what
+    // makes the duration adjustable without touching config.json.
+    // Active/InUse/RemainingDuration are computed/read-only and revert any
+    // manual set; only SetDuration is meant to be changed by you.
+    if (printerConfig.enableAirPurifierSensor) {
+      this.airPurifierSensorService =
+        this.accessory.getServiceById(this.platform.Service.Valve, 'air-purifier') ||
+        this.accessory.addService(
+          this.platform.Service.Valve,
+          `${printerConfig.name} Air Purifier`,
+          'air-purifier',
+        );
+      const airPurifierService = this.airPurifierSensorService;
+      airPurifierService.setCharacteristic(this.platform.Characteristic.Name, `${printerConfig.name} Air Purifier`);
+      airPurifierService.setCharacteristic(this.platform.Characteristic.ValveType, 0); // Generic Valve
+      airPurifierService
+        .getCharacteristic(this.platform.Characteristic.Active)
+        .onGet(() =>
+          this.airPurifierActive
+            ? this.platform.Characteristic.Active.ACTIVE
+            : this.platform.Characteristic.Active.INACTIVE,
+        )
+        .onSet(() => {
+          setTimeout(
+            () =>
+              airPurifierService.updateCharacteristic(
+                this.platform.Characteristic.Active,
+                this.airPurifierActive
+                  ? this.platform.Characteristic.Active.ACTIVE
+                  : this.platform.Characteristic.Active.INACTIVE,
+              ),
+            0,
+          );
+        });
+      airPurifierService
+        .getCharacteristic(this.platform.Characteristic.InUse)
+        .onGet(() =>
+          this.airPurifierActive
+            ? this.platform.Characteristic.InUse.IN_USE
+            : this.platform.Characteristic.InUse.NOT_IN_USE,
+        );
+      airPurifierService
+        .getCharacteristic(this.platform.Characteristic.RemainingDuration)
+        .setProps({ minValue: 0, maxValue: 86400 })
+        .onGet(() => this.airPurifierSecondsRemaining);
+      // The genuinely settable one - onSet here actually persists the value
+      // (in memory; resets to config default on a Homebridge restart) rather
+      // than reverting it, so adjusting it from Home app actually works.
+      airPurifierService
+        .getCharacteristic(this.platform.Characteristic.SetDuration)
+        .setProps({ minValue: 60, maxValue: 21600, minStep: 60 }) // 1 min to 6h, in 1-min steps
+        .onGet(() => (this.airPurifierDurationMinutes ?? printerConfig.airPurifierActiveDurationMinutes ?? 60) * 60)
+        .onSet((value) => {
+          this.airPurifierDurationMinutes = Math.round((value as number) / 60);
+          this.platform.log.info(
+            `[${printerConfig.name}] Air purifier duration set to ${this.airPurifierDurationMinutes} minutes via Home app.`,
+          );
+          // If the window is already running, apply this as "X minutes
+          // remaining from now" immediately, rather than only affecting the
+          // next print's window.
+          if (this.airPurifierActive) {
+            this.airPurifierSecondsRemaining = this.airPurifierDurationMinutes * 60;
+            this.pushAirPurifierState();
+            if (this.printerConfig.useLiveActivity) {
+              void this.updateLiveActivity({ endsIn: this.airPurifierSecondsRemaining });
+            }
+          }
+        });
     }
 
     // Print-started / print-finished notifications - each fires a single "press"
@@ -744,6 +860,8 @@ export class BambuPrinterAccessory {
       void this.updateLiveActivity({
         body: this.buildLiveActivityBodyLine(),
         endsIn: typeof remaining === 'number' && remaining >= 0 ? remaining * 60 : undefined,
+        trailing: typeof remaining === 'number' && remaining >= 0 ? this.formatEtaClockTime(remaining) : undefined,
+        metrics: this.buildLiveActivityMetrics(),
       });
     } else {
       void this.sendPingieNotificationWithSnapshot(
@@ -1244,11 +1362,20 @@ export class BambuPrinterAccessory {
       combinedParts.push(`Total cost: £${combinedTotal.toFixed(2)}` + (filamentInfo?.anyUnpriced ? ' (some materials unpriced)' : '') + '.');
     }
     if (this.printerConfig.useLiveActivity) {
-      await this.endLiveActivity({
-        progress: 100,
-        status: 'done',
-        trailing: (filamentInfo || electricityCost !== undefined) ? `£${combinedTotal.toFixed(2)}` : undefined,
-      });
+      if (this.printerConfig.enableAirPurifierSensor) {
+        // Nothing to do here - startAirPurifierWindow() already transitioned
+        // the tile into the purifying phase synchronously when FINISH was
+        // first detected, before this async method (FTP fetch, GitHub
+        // upload) even got this far. Sending a competing "done" update here
+        // risks a race that overwrites the purifying state if this resolves
+        // after that already happened.
+      } else {
+        await this.endLiveActivity({
+          progress: 100,
+          status: 'done',
+          trailing: (filamentInfo || electricityCost !== undefined) ? `£${combinedTotal.toFixed(2)}` : undefined,
+        });
+      }
     } else {
       await this.sendPingieNotificationWithSnapshot('✅ Print finished', combinedParts.join(' '));
     }
@@ -1287,10 +1414,11 @@ export class BambuPrinterAccessory {
     body?: string;
     symbol?: string;
     tint?: string;
-    progress?: number;
-    endsIn?: number;
-    trailing?: string;
+    progress?: number | null;
+    endsIn?: number | null;
+    trailing?: string | null;
     status?: string;
+    metrics?: Array<{ label: string; value: string; unit?: string; color?: string }> | null;
   }) {
     const devices = this.printerConfig.liveActivityDevices ?? [];
     await Promise.all(devices.map((device) => this.updateLiveActivityForDevice(device, fields)));
@@ -1456,6 +1584,53 @@ export class BambuPrinterAccessory {
   // than waiting for the next progress tick, once paired with the immediate
   // refresh triggered on a speed change (see setPrintSpeed and the spd_lvl
   // reconciliation block).
+  // Formats "now + remainingMinutes" as a clock time (24h, e.g. "14:32") for
+  // the Live Activity's trailing text - a fixed time-of-day ETA alongside the
+  // relative countdown the progress bar/endsIn already show.
+  private formatEtaClockTime(remainingMinutes: number): string {
+    const eta = new Date(Date.now() + remainingMinutes * 60_000);
+    const hours = eta.getHours().toString().padStart(2, '0');
+    const minutes = eta.getMinutes().toString().padStart(2, '0');
+    return `${hours}:${minutes}`;
+  }
+
+  // Up to 6 labeled chips for Pingie's metrics dashboard layout - visually
+  // replaces the body TEXT line on modern app builds (body stays populated
+  // too, as the documented fallback for older ones). A percentage value
+  // ("62%") automatically draws a mini pill-bar per Pingie's own docs.
+  private buildLiveActivityMetrics(): Array<{ label: string; value: string; color?: string }> {
+    const metrics: Array<{ label: string; value: string; color?: string }> = [
+      { label: 'PROGRESS', value: `${this.printProgressPercent}%`, color: '#FF6600' },
+    ];
+
+    const layerNum = this.mergedState.layer_num as number | undefined;
+    const totalLayerNum = this.mergedState.total_layer_num as number | undefined;
+    if (typeof layerNum === 'number' && typeof totalLayerNum === 'number' && totalLayerNum > 0) {
+      metrics.push({ label: 'LAYER', value: `${layerNum}/${totalLayerNum}` });
+    }
+
+    const speedName = BambuPrinterAccessory.SPEED_NAMES[this.currentSpeedLevel];
+    if (speedName) {
+      metrics.push({ label: 'SPEED', value: speedName });
+    }
+
+    if (this.currentPrintMaterials) {
+      metrics.push({ label: 'MATERIAL', value: this.currentPrintMaterials });
+    }
+
+    const cost = this.printEstimatedTotalMinutes ? this.estimateCost(this.printEstimatedTotalMinutes) : undefined;
+    if (cost !== undefined) {
+      metrics.push({ label: 'COST', value: `£${cost.toFixed(2)}` });
+    }
+
+    const remaining = this.mergedState.mc_remaining_time as number | undefined;
+    if (typeof remaining === 'number' && remaining >= 0) {
+      metrics.push({ label: 'ETA', value: this.formatEtaClockTime(remaining) });
+    }
+
+    return metrics.slice(0, 6); // hard cap, matching Pingie's documented max
+  }
+
   private buildLiveActivityBodyLine(): string {
     // printProgressPercent already tracks the real current percentage
     // continuously (same field driving the Progress fan), independent of the
@@ -1768,13 +1943,16 @@ export class BambuPrinterAccessory {
       // mc_remaining_time to correct for whatever drifted during the pause.
       if (this.printerConfig.useLiveActivity) {
         if (pausedNow) {
-          void this.updateLiveActivity({ status: 'paused' });
+          void this.updateLiveActivity({ status: 'paused', symbol: 'pause.fill' });
         } else {
           const remaining = this.mergedState.mc_remaining_time as number | undefined;
           void this.updateLiveActivity({
             status: 'printing',
+            symbol: this.printerConfig.liveActivitySymbol ?? 'printer.fill',
             endsIn: typeof remaining === 'number' && remaining >= 0 ? remaining * 60 : undefined,
             body: this.buildLiveActivityBodyLine(),
+            trailing: typeof remaining === 'number' && remaining >= 0 ? this.formatEtaClockTime(remaining) : undefined,
+            metrics: this.buildLiveActivityMetrics(),
           });
         }
       }
@@ -1795,6 +1973,11 @@ export class BambuPrinterAccessory {
         if (this.printerConfig.useLiveActivity && this.currentlyOccupied) {
           void this.updateLiveActivity({
             body: `🌡️ Heating bed: ${bedCurrent.toFixed(0)}°C → ${bedTarget.toFixed(0)}°C`,
+            // Explicitly cleared: metrics visually replaces body on modern
+            // app builds per Pingie's docs, so without this the heating
+            // message would be silently buried under stale progress chips.
+            // Resumes on the next regular progress tick.
+            metrics: null,
           });
         } else {
           void this.sendPingieNotificationWithSnapshot(
@@ -1816,6 +1999,7 @@ export class BambuPrinterAccessory {
         if (this.printerConfig.useLiveActivity && this.currentlyOccupied) {
           void this.updateLiveActivity({
             body: `🌡️ Heating nozzle: ${nozzleCurrent.toFixed(0)}°C → ${nozzleTarget.toFixed(0)}°C`,
+            metrics: null,
           });
         } else {
           void this.sendPingieNotificationWithSnapshot(
@@ -1920,7 +2104,7 @@ export class BambuPrinterAccessory {
       this.firstLayerCheckActive = firstLayerCheckActive;
       if (firstLayerCheckActive) {
         if (this.printerConfig.useLiveActivity && this.currentlyOccupied) {
-          void this.updateLiveActivity({ body: '👁️ Inspecting first layer' });
+          void this.updateLiveActivity({ body: '👁️ Inspecting first layer', metrics: null });
         } else {
           void this.sendPingieNotificationWithSnapshot(
             '👁️ First layer check',
@@ -2077,6 +2261,7 @@ export class BambuPrinterAccessory {
           void this.updateLiveActivity({
             endsIn: this.printEstimatedTotalMinutes ? this.printEstimatedTotalMinutes * 60 : undefined,
             body: this.buildLiveActivityBodyLine(),
+            trailing: this.printEstimatedTotalMinutes ? this.formatEtaClockTime(this.printEstimatedTotalMinutes) : undefined,
           });
         } else {
           void this.sendPingieNotificationWithSnapshot('🖨️ Print started', parts.join(' '));
@@ -2101,6 +2286,7 @@ export class BambuPrinterAccessory {
       );
 
       void this.sendFinishedNotifications(elapsedMinutes);
+      this.startAirPurifierWindow();
 
       this.printStartTimestamp = undefined;
       this.printEstimatedTotalMinutes = undefined;
@@ -2123,7 +2309,14 @@ export class BambuPrinterAccessory {
       );
 
       if (this.printerConfig.useLiveActivity) {
-        void this.endLiveActivity({ status: 'failed' });
+        if (this.printerConfig.enableAirPurifierSensor) {
+          // Same reasoning as FINISH - a failed/cancelled print still had
+          // material extruded and things hot, so still worth a purifier
+          // window. startAirPurifierWindow() handles the tile transition and
+          // the real end call once that window closes.
+        } else {
+          void this.endLiveActivity({ status: 'failed' });
+        }
       } else {
         void this.sendPingieNotificationWithSnapshot(
           '❌ Print failed',
@@ -2131,6 +2324,7 @@ export class BambuPrinterAccessory {
             (elapsedMinutes ? ` after ${this.formatDuration(elapsedMinutes)}` : '') + '.',
         );
       }
+      this.startAirPurifierWindow();
 
       this.printStartTimestamp = undefined;
       this.printEstimatedTotalMinutes = undefined;
@@ -2233,6 +2427,8 @@ export class BambuPrinterAccessory {
               endsIn: typeof remaining === 'number' && remaining >= 0 ? remaining * 60 : undefined,
               status: 'printing',
               body: this.buildLiveActivityBodyLine(),
+              trailing: typeof remaining === 'number' && remaining >= 0 ? this.formatEtaClockTime(remaining) : undefined,
+              metrics: this.buildLiveActivityMetrics(),
             });
           }
         }
@@ -2311,6 +2507,92 @@ export class BambuPrinterAccessory {
     );
   }
 
+  // Starts (or restarts) the air purifier window - called from FINISH and
+  // FAILED alike, since off-gassing doesn't care whether the print succeeded.
+  // If a Live Activity is active for this print, it gets extended into a
+  // "purifying" phase rather than ending immediately - the real end call is
+  // deferred until this window itself closes.
+  private startAirPurifierWindow() {
+    if (!this.printerConfig.enableAirPurifierSensor) {
+      return;
+    }
+    if (this.airPurifierTicker) {
+      clearInterval(this.airPurifierTicker);
+    }
+    const durationMinutes = this.airPurifierDurationMinutes ?? this.printerConfig.airPurifierActiveDurationMinutes ?? 60;
+    this.airPurifierSecondsRemaining = durationMinutes * 60;
+    this.airPurifierActive = true;
+    this.pushAirPurifierState();
+
+    if (this.printerConfig.useLiveActivity) {
+      void this.updateLiveActivity({
+        title: `${this.printerConfig.name} Air Purifying`,
+        symbol: this.printerConfig.liveActivityPurifierSymbol ?? 'aqi.medium',
+        tint: this.printerConfig.liveActivityPurifierTint ?? '#0A84FF',
+        status: 'purifying',
+        body: '🌬️ Air purifier running',
+        endsIn: this.airPurifierSecondsRemaining,
+        progress: null,
+        // Print metrics (progress/layer/speed/material/cost) no longer apply
+        // once purifying begins - clearing rather than leaving stale.
+        metrics: null,
+      });
+    }
+
+    this.airPurifierTicker = setInterval(() => {
+      if (this.airPurifierSecondsRemaining > 0) {
+        this.airPurifierSecondsRemaining -= 1;
+      }
+      this.airPurifierSensorService?.updateCharacteristic(
+        this.platform.Characteristic.RemainingDuration,
+        this.airPurifierSecondsRemaining,
+      );
+      if (this.airPurifierSecondsRemaining <= 0) {
+        this.stopAirPurifierWindow();
+      }
+    }, 1000);
+  }
+
+  private stopAirPurifierWindow() {
+    if (this.airPurifierTicker) {
+      clearInterval(this.airPurifierTicker);
+      this.airPurifierTicker = undefined;
+    }
+    this.airPurifierActive = false;
+    this.airPurifierSecondsRemaining = 0;
+    this.pushAirPurifierState();
+    this.platform.log.info(`[${this.printerConfig.name}] Air purifier window closed.`);
+
+    // Now that the purifier phase (if any) is genuinely done, actually end
+    // the Live Activity - this is the real end call that FINISH/FAILED
+    // deferred when they extended the tile into the purifying phase.
+    if (this.printerConfig.useLiveActivity) {
+      void this.endLiveActivity({ status: 'done' });
+    }
+  }
+
+  private pushAirPurifierState() {
+    if (!this.airPurifierSensorService) {
+      return;
+    }
+    this.airPurifierSensorService.updateCharacteristic(
+      this.platform.Characteristic.Active,
+      this.airPurifierActive
+        ? this.platform.Characteristic.Active.ACTIVE
+        : this.platform.Characteristic.Active.INACTIVE,
+    );
+    this.airPurifierSensorService.updateCharacteristic(
+      this.platform.Characteristic.InUse,
+      this.airPurifierActive
+        ? this.platform.Characteristic.InUse.IN_USE
+        : this.platform.Characteristic.InUse.NOT_IN_USE,
+    );
+    this.airPurifierSensorService.updateCharacteristic(
+      this.platform.Characteristic.RemainingDuration,
+      this.airPurifierSecondsRemaining,
+    );
+  }
+
   public shutdown() {
     if (this.reconnectTimer) {
       clearTimeout(this.reconnectTimer);
@@ -2323,6 +2605,9 @@ export class BambuPrinterAccessory {
     }
     if (this.speedCommandCorrectionTimer) {
       clearTimeout(this.speedCommandCorrectionTimer);
+    }
+    if (this.airPurifierTicker) {
+      clearInterval(this.airPurifierTicker);
     }
     this.stopRefreshTimer();
     this.client?.end(true);

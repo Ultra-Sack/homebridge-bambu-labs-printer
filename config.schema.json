@@ -237,6 +237,37 @@
               "default": false,
               "description": "Off by default. Adds three Temperature Sensor accessories to Home app."
             },
+            "lightAccessoryType": {
+              "title": "Chamber Light Accessory Type",
+              "type": "string",
+              "enum": ["lightbulb", "switch"],
+              "default": "lightbulb",
+              "description": "\"switch\" avoids Siri's \"turn off all the lights\" sweeping up the chamber light during a print - Siri specifically targets the Lightbulb category. Identical on/off behavior either way. Switching modes automatically removes the tile no longer in use."
+            },
+            "enableAirPurifierSensor": {
+              "title": "Air Purifier Trigger Sensor",
+              "type": "boolean",
+              "default": false,
+              "description": "Off by default. A Valve accessory that goes active the moment a print finishes (or fails/cancels), for automating something like an air purifier alongside the printer. The duration is also adjustable directly from the Home app, not just here."
+            },
+            "airPurifierActiveDurationMinutes": {
+              "title": "Air Purifier Active Duration (minutes)",
+              "type": "number",
+              "default": 60,
+              "description": "Initial default only - once adjusted via the Home app (the Valve's SetDuration control), that value takes over until the next Homebridge restart."
+            },
+            "liveActivityPurifierSymbol": {
+              "title": "Live Activity Purifier Icon (SF Symbol name)",
+              "type": "string",
+              "default": "aqi.medium",
+              "description": "Shown on the Live Activity tile during the purifying phase. Confirmed to exist in Apple's SF Symbols catalogue (unlike the earlier \"wind\" default)."
+            },
+            "liveActivityPurifierTint": {
+              "title": "Live Activity Purifier Accent Color",
+              "type": "string",
+              "default": "#0A84FF",
+              "description": "Distinct from the main printing-phase tint, so the purifying phase is visually distinguishable at a glance, not just by text."
+            },
             "amsId": {
               "title": "AMS 2 Pro Drying ID (experimental)",
               "type": "number",
