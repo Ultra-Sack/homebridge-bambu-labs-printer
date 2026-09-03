@@ -4,6 +4,17 @@ import { Client as FtpClient } from 'basic-ftp';
 import { Writable } from 'stream';
 import AdmZip from 'adm-zip';
 import { XMLParser } from 'fast-xml-parser';
+import {
+  Client as DiscordClient,
+  GatewayIntentBits,
+  Partials,
+  AttachmentBuilder,
+  Message as DiscordMessage,
+  MessageReaction,
+  User as DiscordUser,
+  PartialMessageReaction,
+  PartialUser,
+} from 'discord.js';
 // eslint-disable-next-line @typescript-eslint/no-var-requires
 const ping = require('ping') as { promise: { probe: (host: string) => Promise<{ alive: boolean }> } };
 import { BambuPrintStatusPlatform } from './platform';
@@ -140,16 +151,64 @@ export interface PrinterConfig {
   // same On characteristic.
   lightAccessoryType?: 'lightbulb' | 'switch';
 
-  // Air purifier trigger - opt-in, off by default. A Valve service that goes
-  // active the moment a print FINISHES (or fails/cancels), staying active for
-  // a duration you can adjust directly from the Home app (SetDuration - a
-  // real settable characteristic, unlike Occupancy Sensor's fixed on/off).
-  // Active/InUse/RemainingDuration are computed/read-only; only SetDuration
-  // is genuinely user-controllable.
+  // Air purifier trigger - opt-in, off by default. A Contact Sensor, not a
+  // Valve - confirmed via real testing that Home app's automation trigger
+  // picker doesn't offer Valve accessories as a trigger source at all (it's
+  // built around sensor types), unlike Contact Sensor which is already
+  // proven throughout this plugin (Fault/Filament/Door). Fixed duration only,
+  // no Home-app-adjustable SetDuration - that complexity was specifically
+  // what didn't work in practice, given Valve wasn't usable as a trigger.
+  // Alarm-style semantics matching Fault/Filament: NOT_DETECTED = active
+  // (purifying), DETECTED = idle.
   enableAirPurifierSensor?: boolean;
-  airPurifierActiveDurationMinutes?: number; // initial default for SetDuration, before any Home app adjustment
+  airPurifierActiveDurationMinutes?: number;
   liveActivityPurifierSymbol?: string; // SF Symbol for the tile during the purifier phase - confirmed to exist (aqi.medium), unlike the earlier wind guess
   liveActivityPurifierTint?: string; // distinct accent color for the purifying phase, so it's visually distinguishable from the printing phase at a glance
+  // Per-chip colors for the metrics dashboard - confirmed via Pingie's own
+  // docs to be plain hex (#RRGGBB), no restricted palette. Each is
+  // independently configurable via the Homebridge UI.
+  liveActivityColorProgress?: string;
+  liveActivityColorLayer?: string;
+  liveActivityColorSpeed?: string;
+  liveActivityColorMaterial?: string;
+  liveActivityColorCost?: string;
+  liveActivityColorEta?: string;
+  // IANA time zone for the metrics dashboard's ETA chip - explicit, rather
+  // than trusting the host system's local timezone setting, since Docker
+  // containers commonly default to UTC regardless of actual location.
+  liveActivityTimezone?: string;
+
+  // Spaghetti detection - opt-in AI assessment, off by default. The
+  // detection + snapshot notification itself works without this (just no AI
+  // text), using your own Anthropic API key like any other direct API
+  // integration - purely advisory, never acts on the print automatically.
+  enableAiSpaghettiAssessment?: boolean;
+  anthropicApiKey?: string;
+
+  // Genuinely off by default, and worth thinking twice about. Lets the AI
+  // assessment above autonomously PAUSE the print (never a full cancel/abort
+  // - pause is reversible, matching why the Pause switch itself never got a
+  // Stop control) if it judges the print has genuinely failed. AI judgment
+  // from a single photo is fallible in both directions: wrongly pausing
+  // interrupts a fine print, wrongly continuing lets a real failure keep
+  // running unsupervised. This gives the plugin more autonomous authority
+  // over the printer than Bambu's own first-party AI monitoring exercises -
+  // their system only ever flags, it doesn't act.
+  // This flag now only controls whether the "AI Auto-Pause" HomeKit Switch
+  // EXISTS at all - it does NOT enable autonomous behaviour by itself. The
+  // switch is the real gate: it defaults off, resets to off automatically at
+  // the start of every new print (not just on a Homebridge restart), and
+  // must be manually turned on again for each print you actually want it
+  // active for.
+  enableAiAutoPauseOnSpaghetti?: boolean;
+
+  // Discord bot integration - interactive pause/continue decisions with a
+  // real human response, via reaction or natural-language text reply.
+  // Connects outbound only (Discord's Gateway WebSocket, same category of
+  // thing as the MQTT connection to the printer) - no public server, no
+  // inbound ports, no webhook needed at all.
+  discordBotToken?: string;
+  discordUserIds?: string[];
 
   // AMS 2 Pro remote drying control - opt-in, the switch/logic only gets
   // created if amsId is set. The drying MQTT command is reverse-engineered
@@ -186,9 +245,13 @@ export class BambuPrinterAccessory {
   private nozzleTempService?: Service;
   private chamberTempService?: Service;
   private airPurifierSensorService?: Service;
+  private aiAutoPauseSwitchService?: Service;
+  // Real safety gate, separate from config: defaults off, resets to off at
+  // the start of every new print - the config flag only controls whether
+  // the switch exists, this field is what actually gates the behaviour.
+  private aiAutoPauseSwitchOn = false;
   private airPurifierActive = false;
-  private airPurifierTicker?: ReturnType<typeof setInterval>;
-  private airPurifierDurationMinutes?: number; // undefined = use config default; set once adjusted via Home app
+  private airPurifierTicker?: ReturnType<typeof setTimeout>;
   private airPurifierSecondsRemaining = 0;
   private readonly pauseService: Service;
   private readonly startedSwitchService: Service;
@@ -206,6 +269,7 @@ export class BambuPrinterAccessory {
   private loggedHumidityScaleHint = false;
   private faultPresent = false;
   private firstLayerCheckActive = false;
+  private spaghettiActive = false;
   private filamentOut = false;
   private doorOpen = false;
   private previousGcodeState?: string;
@@ -228,6 +292,15 @@ export class BambuPrinterAccessory {
   private lastNotifiedLiveActivityBucket = -1;
   private cameraUiToken?: string;
   private cameraUiTokenExpiresAt = 0;
+  private discordClient?: DiscordClient;
+  // Only one incident tracked at a time, deliberately - overlapping
+  // spaghetti detections are rare enough that a new one simply replaces
+  // tracking for the old one, rather than building a multi-incident queue.
+  private pendingDiscordDecision?: {
+    resolve: (verdict: 'pause' | 'continue', responderName: string) => void;
+    sentTo: Array<{ userId: string; messageId: string; channelId: string }>;
+    resolved: boolean;
+  };
   private startNotificationTimer?: ReturnType<typeof setTimeout>;
 
   // Bambu printers send partial diffs after the first message, so we keep a
@@ -547,77 +620,97 @@ export class BambuPrinterAccessory {
         .setProps({ minValue: -20, maxValue: 100 });
     }
 
-    // Air purifier trigger - opt-in, off by default. A Valve rather than an
-    // Occupancy Sensor specifically because SetDuration is genuinely
-    // user-settable from the Home app (a real +/- control on the Valve's
-    // detail screen), unlike anything Occupancy Sensor offers - this is what
-    // makes the duration adjustable without touching config.json.
-    // Active/InUse/RemainingDuration are computed/read-only and revert any
-    // manual set; only SetDuration is meant to be changed by you.
+    // Air purifier trigger - opt-in, off by default. A Contact Sensor, not a
+    // Valve - real testing confirmed Home app's automation trigger picker
+    // doesn't offer Valve accessories as a trigger source at all, unlike
+    // Contact Sensor (already proven via Fault/Filament/Door elsewhere in
+    // this plugin). Fixed duration only via airPurifierActiveDurationMinutes
+    // - no Home-app-adjustable control, since that was specifically the part
+    // that didn't work. Alarm-style semantics matching Fault/Filament:
+    // NOT_DETECTED = active (purifying), DETECTED = idle.
     if (printerConfig.enableAirPurifierSensor) {
+      const orphan = this.accessory.getServiceById(this.platform.Service.Valve, 'air-purifier');
+      if (orphan) {
+        this.accessory.removeService(orphan);
+      }
       this.airPurifierSensorService =
-        this.accessory.getServiceById(this.platform.Service.Valve, 'air-purifier') ||
+        this.accessory.getServiceById(this.platform.Service.ContactSensor, 'air-purifier') ||
         this.accessory.addService(
-          this.platform.Service.Valve,
+          this.platform.Service.ContactSensor,
           `${printerConfig.name} Air Purifier`,
           'air-purifier',
         );
-      const airPurifierService = this.airPurifierSensorService;
-      airPurifierService.setCharacteristic(this.platform.Characteristic.Name, `${printerConfig.name} Air Purifier`);
-      airPurifierService.setCharacteristic(this.platform.Characteristic.ValveType, 0); // Generic Valve
-      airPurifierService
-        .getCharacteristic(this.platform.Characteristic.Active)
+      this.airPurifierSensorService.setCharacteristic(
+        this.platform.Characteristic.Name,
+        `${printerConfig.name} Air Purifier`,
+      );
+      this.airPurifierSensorService
+        .getCharacteristic(this.platform.Characteristic.ContactSensorState)
         .onGet(() =>
           this.airPurifierActive
-            ? this.platform.Characteristic.Active.ACTIVE
-            : this.platform.Characteristic.Active.INACTIVE,
-        )
-        .onSet(() => {
-          setTimeout(
-            () =>
-              airPurifierService.updateCharacteristic(
-                this.platform.Characteristic.Active,
-                this.airPurifierActive
-                  ? this.platform.Characteristic.Active.ACTIVE
-                  : this.platform.Characteristic.Active.INACTIVE,
-              ),
-            0,
-          );
-        });
-      airPurifierService
-        .getCharacteristic(this.platform.Characteristic.InUse)
-        .onGet(() =>
-          this.airPurifierActive
-            ? this.platform.Characteristic.InUse.IN_USE
-            : this.platform.Characteristic.InUse.NOT_IN_USE,
+            ? this.platform.Characteristic.ContactSensorState.CONTACT_NOT_DETECTED
+            : this.platform.Characteristic.ContactSensorState.CONTACT_DETECTED,
         );
-      airPurifierService
-        .getCharacteristic(this.platform.Characteristic.RemainingDuration)
-        .setProps({ minValue: 0, maxValue: 86400 })
-        .onGet(() => this.airPurifierSecondsRemaining);
-      // The genuinely settable one - onSet here actually persists the value
-      // (in memory; resets to config default on a Homebridge restart) rather
-      // than reverting it, so adjusting it from Home app actually works.
-      airPurifierService
-        .getCharacteristic(this.platform.Characteristic.SetDuration)
-        .setProps({ minValue: 60, maxValue: 21600, minStep: 60 }) // 1 min to 6h, in 1-min steps
-        .onGet(() => (this.airPurifierDurationMinutes ?? printerConfig.airPurifierActiveDurationMinutes ?? 60) * 60)
+    } else {
+      // Real gap fixed here: previously, toggling this off just stopped
+      // creating new ones - it never removed an existing tile, leaving it
+      // orphaned in Home app forever. Also clears any leftover persisted
+      // window state, so a stale in-progress window from before doesn't
+      // resurrect anything if the feature is re-enabled later.
+      const orphanContact = this.accessory.getServiceById(this.platform.Service.ContactSensor, 'air-purifier');
+      if (orphanContact) {
+        this.accessory.removeService(orphanContact);
+      }
+      const orphanValve = this.accessory.getServiceById(this.platform.Service.Valve, 'air-purifier');
+      if (orphanValve) {
+        this.accessory.removeService(orphanValve);
+      }
+      delete this.accessory.context.airPurifierActiveUntil;
+    }
+
+    // AI Auto-Pause - a genuinely settable Switch, not a computed/read-only
+    // one like everything else in this plugin. The config flag only
+    // controls whether this switch exists at all; the switch itself is the
+    // real safety gate - defaults off, and gets reset to off automatically
+    // at the start of every new print (see the RUNNING-transition block),
+    // so it can never silently carry over from one print to the next
+    // without a conscious re-enable each time.
+    if (printerConfig.enableAiAutoPauseOnSpaghetti) {
+      this.aiAutoPauseSwitchService =
+        this.accessory.getServiceById(this.platform.Service.Switch, 'ai-auto-pause') ||
+        this.accessory.addService(
+          this.platform.Service.Switch,
+          `${printerConfig.name} AI Auto-Pause`,
+          'ai-auto-pause',
+        );
+      const aiAutoPauseService = this.aiAutoPauseSwitchService;
+      aiAutoPauseService.setCharacteristic(
+        this.platform.Characteristic.Name,
+        `${printerConfig.name} AI Auto-Pause`,
+      );
+      aiAutoPauseService
+        .getCharacteristic(this.platform.Characteristic.On)
+        .onGet(() => this.aiAutoPauseSwitchOn)
         .onSet((value) => {
-          this.airPurifierDurationMinutes = Math.round((value as number) / 60);
-          this.platform.log.info(
-            `[${printerConfig.name}] Air purifier duration set to ${this.airPurifierDurationMinutes} minutes via Home app.`,
+          this.aiAutoPauseSwitchOn = value as boolean;
+          this.platform.log.warn(
+            `[${printerConfig.name}] AI Auto-Pause ${this.aiAutoPauseSwitchOn ? 'ENABLED' : 'disabled'} for the ` +
+              (this.aiAutoPauseSwitchOn
+                ? 'current print. Resets to off automatically once this print ends.'
+                : 'current print.'),
           );
-          // If the window is already running, apply this as "X minutes
-          // remaining from now" immediately, rather than only affecting the
-          // next print's window.
-          if (this.airPurifierActive) {
-            this.airPurifierSecondsRemaining = this.airPurifierDurationMinutes * 60;
-            this.pushAirPurifierState();
-            if (this.printerConfig.useLiveActivity) {
-              void this.updateLiveActivity({ endsIn: this.airPurifierSecondsRemaining });
-            }
+          // Push an immediate Live Activity refresh so the AI PAUSE chip
+          // reflects the change right away, rather than waiting up to the
+          // next scheduled progress tick.
+          if (this.printerConfig.useLiveActivity && this.currentlyOccupied) {
+            void this.updateLiveActivity({ metrics: this.buildLiveActivityMetrics() });
           }
         });
+    } else {
+      const orphan = this.accessory.getServiceById(this.platform.Service.Switch, 'ai-auto-pause');
+      if (orphan) {
+        this.accessory.removeService(orphan);
+      }
     }
 
     // Print-started / print-finished notifications - each fires a single "press"
@@ -719,6 +812,20 @@ export class BambuPrinterAccessory {
           : this.platform.Characteristic.ContactSensorState.CONTACT_DETECTED,
       );
 
+    this.resumeAirPurifierWindowIfNeeded();
+    this.initializeDiscordBot();
+
+    if (printerConfig.enableAiAutoPauseOnSpaghetti) {
+      this.platform.log.info(
+        `[${printerConfig.name}] The "AI Auto-Pause" switch is available in Home app. It defaults off and resets ` +
+          'automatically at the start of every new print - you need to consciously turn it on again each time you ' +
+          "want it active for that specific print. When it's on, an AI model's judgment from a single camera photo " +
+          "can autonomously PAUSE or RESUME the print based on a flagged spaghetti defect - more autonomous " +
+          "authority than Bambu's own first-party AI monitoring exercises (it only ever flags, never acts). AI " +
+          'vision judgment is fallible in both directions.',
+      );
+    }
+
     this.connect();
   }
 
@@ -728,6 +835,13 @@ export class BambuPrinterAccessory {
   // Fault sensor/alarm notification - handled as its own separate, non-alarming
   // notification instead.
   private static readonly FIRST_LAYER_CHECK_HMS_CODE = '0C00-0300-0003-000B';
+  private static readonly SPAGHETTI_HMS_CODE = '0C00-0300-0003-0008';
+  // Real-world confirmed gap: Bambu's firmware can also report a spaghetti
+  // defect via print_error (a completely separate code space from the HMS
+  // array above) - this is what actually fired for a real user, bypassing
+  // the HMS-only check entirely. Three known print_error codes for this,
+  // found directly in the bundled error table.
+  private static readonly SPAGHETTI_PRINT_ERROR_CODES = ['0300_8003', '0C00_8002', '0C00_C004'];
   private static readonly SPEED_NAMES = ['', 'Silent', 'Standard', 'Sport', 'Ludicrous'];
   private static readonly SPEED_EMOJIS = ['', '🐢', '🚶', '🏃', '🚀'];
 
@@ -860,7 +974,6 @@ export class BambuPrinterAccessory {
       void this.updateLiveActivity({
         body: this.buildLiveActivityBodyLine(),
         endsIn: typeof remaining === 'number' && remaining >= 0 ? remaining * 60 : undefined,
-        trailing: typeof remaining === 'number' && remaining >= 0 ? this.formatEtaClockTime(remaining) : undefined,
         metrics: this.buildLiveActivityMetrics(),
       });
     } else {
@@ -1168,6 +1281,432 @@ export class BambuPrinterAccessory {
     }
 
     return { totalCost, anyUnpriced, byMaterial };
+  }
+
+  // Fired once when Bambu's own AI first detects a possible spaghetti defect
+  // (edge-triggered - handled by the caller). Captures a LIVE camera
+  // snapshot specifically (not the static 3MF-rendered preview thumbnail,
+  // even if includePrintPreviewImage is on - a genuine current-state photo
+  // is the whole point here), optionally gets an AI text assessment, and
+  // sends one dedicated notification. Every step degrades gracefully - a
+  // missing camera.ui config, a failed capture, or a failed/disabled AI call
+  // still results in a real notification, just with less attached.
+  private async handleSpaghettiDetected() {
+    this.platform.log.info(`[${this.printerConfig.name}] Possible spaghetti defect detected.`);
+
+    const jpeg = await this.captureSnapshotFromCameraUi();
+    const snapshotUrl = jpeg
+      ? await this.uploadImageToGithub(jpeg, this.printerConfig.githubSnapshotPath ?? 'images/latest-print.jpg')
+      : undefined;
+
+    // Both gates required: the config flag only controls whether the switch
+    // exists at all, aiAutoPauseSwitchOn is the real per-print decision -
+    // defaults off, reset automatically at the start of every new print.
+    const autoPauseEnabled = Boolean(this.printerConfig.enableAiAutoPauseOnSpaghetti && this.aiAutoPauseSwitchOn);
+    const wantsAssessment = jpeg && (this.printerConfig.enableAiSpaghettiAssessment || autoPauseEnabled);
+
+    let assessment: { text?: string; verdict?: 'pause' | 'continue' } = {};
+    if (wantsAssessment && jpeg) {
+      assessment = await this.assessSpaghettiWithAI(jpeg, Boolean(autoPauseEnabled));
+    }
+
+    const parts = [`${this.printerConfig.name}: Bambu's own AI flagged a possible spaghetti defect.`];
+    if (assessment.text) {
+      parts.push(
+        autoPauseEnabled ? `AI take: ${assessment.text}` : `AI take (advisory only, your call): ${assessment.text}`,
+      );
+    } else if (!jpeg) {
+      parts.push('No camera snapshot available - check includeCameraSnapshot/camera.ui config to attach one.');
+    }
+
+    // Symmetric: pause when currently running and the verdict says stop,
+    // resume when currently paused and the verdict says it's fine. Never a
+    // full cancel/abort - only pause/resume, both reversible. Only acts
+    // immediately here when the AI itself gave a confident verdict in auto
+    // mode - the Discord-escalation and manual-mode paths resolve later,
+    // asynchronously, after this notification has already gone out.
+    if (autoPauseEnabled && assessment.verdict) {
+      const acted = this.applySpaghettiVerdict(assessment.verdict, 'automatically based on this AI assessment');
+      if (acted) {
+        parts.push(
+          assessment.verdict === 'pause'
+            ? '⏸️ Automatically paused based on this AI assessment.'
+            : '▶️ Automatically resumed based on this AI assessment.',
+        );
+      } else {
+        // No state change needed (e.g. verdict was "continue" and the print
+        // was already running) - still say so explicitly, rather than
+        // silently omitting any mention of the decision that was reached.
+        parts.push(
+          assessment.verdict === 'pause'
+            ? '⏸️ AI decided to pause, but the print was already paused.'
+            : '✅ AI decided the print should continue - no action needed.',
+        );
+      }
+    }
+
+    await this.sendPingieNotification('🍝 Possible spaghetti detected', parts.join(' '), snapshotUrl);
+
+    // Discord runs independently, AFTER the primary notification above -
+    // this can genuinely take a long time (waiting for a human to respond),
+    // and must never delay the immediate Pingie push.
+    if (this.discordClient && this.printerConfig.discordUserIds?.length && jpeg) {
+      if (autoPauseEnabled && assessment.verdict) {
+        // Confident verdict: already acted above - Discord just explains why.
+        void this.sendDiscordExplanationToAll(
+          jpeg,
+          `\ud83c\udf5d Spaghetti defect detected on ${this.printerConfig.name}.\n\n` +
+            `${assessment.text ?? 'No detailed explanation available.'}\n\n` +
+            `Decision: **${assessment.verdict.toUpperCase()}** (made automatically).`,
+        );
+      } else {
+        // Either not in auto mode, or the AI genuinely wasn't confident -
+        // both become the same interactive question.
+        void this.runInteractiveSpaghettiDiscordFlow(jpeg, assessment.text, Boolean(autoPauseEnabled));
+      }
+    }
+  }
+
+  // Shared by the immediate auto-verdict path and the later Discord-decision
+  // path - returns whether an action was actually taken (false if the
+  // requested state already matched reality, e.g. "pause" while already
+  // paused).
+  private applySpaghettiVerdict(verdict: 'pause' | 'continue', sourceDescription: string): boolean {
+    if (verdict === 'pause' && !this.currentlyPaused) {
+      this.platform.log.warn(`[${this.printerConfig.name}] Pausing the print ${sourceDescription}.`);
+      this.setPauseState(true);
+      return true;
+    }
+    if (verdict === 'continue' && this.currentlyPaused) {
+      this.platform.log.warn(`[${this.printerConfig.name}] Resuming the print ${sourceDescription}.`);
+      this.setPauseState(false);
+      return true;
+    }
+    return false;
+  }
+
+  // Runs independently of the main detection flow - asks all configured
+  // Discord users, waits (however long that takes) for the first valid
+  // response (reaction or natural-language text, interpreted via AI), acts
+  // on it, and sends a follow-up Pingie notification once resolved so
+  // there's a record even for someone not watching Discord.
+  private async runInteractiveSpaghettiDiscordFlow(jpeg: Buffer, aiText: string | undefined, wasUnsureAutoMode: boolean) {
+    const intro = wasUnsureAutoMode
+      ? `\ud83c\udf5d Spaghetti defect detected on ${this.printerConfig.name}, but I'm not confident enough to decide automatically.`
+      : `\ud83c\udf5d Spaghetti defect detected on ${this.printerConfig.name}.`;
+    const question =
+      intro +
+      (aiText ? `\n\n${aiText}` : '') +
+      '\n\nShould I pause the print? React \u2705 to continue, \ud83d\uded1 to pause, or just reply in words.';
+
+    const result = await this.askDiscordUsersAndWaitForDecision(jpeg, question);
+    if (!result) {
+      return;
+    }
+    const acted = this.applySpaghettiVerdict(result.verdict, `based on ${result.responderName}'s Discord reply`);
+    const summary = acted
+      ? `${result.responderName} decided: ${result.verdict.toUpperCase()} - action taken.`
+      : `${result.responderName} decided: ${result.verdict.toUpperCase()} (already matched the current state, nothing to do).`;
+    void this.sendPingieNotification('\ud83c\udf5d Spaghetti decision received', `${this.printerConfig.name}: ${summary}`);
+  }
+
+  // Sends the same photo + question to every configured Discord user,
+  // reacts with the two decision emojis on each, and resolves once ANY of
+  // them responds first - via reaction or a natural-language text reply
+  // (interpreted with the same Anthropic key used for the visual
+  // assessment). Cross-notifies everyone else the moment it resolves.
+  private async askDiscordUsersAndWaitForDecision(
+    jpeg: Buffer,
+    questionText: string,
+  ): Promise<{ verdict: 'pause' | 'continue'; responderName: string } | undefined> {
+    if (!this.discordClient || !this.printerConfig.discordUserIds?.length) {
+      return undefined;
+    }
+    const sentTo: Array<{ userId: string; messageId: string; channelId: string }> = [];
+
+    for (const userId of this.printerConfig.discordUserIds) {
+      try {
+        const user = await this.discordClient.users.fetch(userId);
+        const attachment = new AttachmentBuilder(jpeg, { name: 'spaghetti.jpg' });
+        const sent = await user.send({ content: questionText, files: [attachment] });
+        await sent.react('\u2705').catch(() => undefined);
+        await sent.react('\ud83d\uded1').catch(() => undefined);
+        sentTo.push({ userId, messageId: sent.id, channelId: sent.channelId });
+      } catch (err) {
+        this.platform.log.warn(
+          `[${this.printerConfig.name}] Failed to message Discord user ${userId}: ${(err as Error).message}`,
+        );
+      }
+    }
+
+    if (sentTo.length === 0) {
+      return undefined;
+    }
+
+    return new Promise((resolve) => {
+      this.pendingDiscordDecision = {
+        resolved: false,
+        sentTo,
+        resolve: (verdict, responderName) => resolve({ verdict, responderName }),
+      };
+    });
+  }
+
+  // Called once, the moment either a reaction or an interpreted text reply
+  // resolves the pending decision - marks it resolved (first response wins;
+  // later ones are ignored) and cross-notifies every other user who was
+  // asked but didn't respond.
+  private resolveDiscordDecision(verdict: 'pause' | 'continue', responderId: string, responderName: string) {
+    const pending = this.pendingDiscordDecision;
+    if (!pending || pending.resolved) {
+      return;
+    }
+    pending.resolved = true;
+    this.platform.log.info(`[${this.printerConfig.name}] Discord decision: ${verdict}, from ${responderName}.`);
+
+    for (const entry of pending.sentTo) {
+      if (entry.userId === responderId) {
+        continue;
+      }
+      void this.sendDiscordDM(
+        entry.userId,
+        `${responderName} already responded to the spaghetti question: **${verdict.toUpperCase()}**. ` +
+          'No action needed from you - thanks anyway!',
+      );
+    }
+
+    pending.resolve(verdict, responderName);
+  }
+
+  private async sendDiscordDM(userId: string, content: string, jpeg?: Buffer) {
+    if (!this.discordClient) {
+      return;
+    }
+    try {
+      const user = await this.discordClient.users.fetch(userId);
+      const files = jpeg ? [new AttachmentBuilder(jpeg, { name: 'spaghetti.jpg' })] : undefined;
+      await user.send({ content, files });
+    } catch (err) {
+      this.platform.log.warn(`[${this.printerConfig.name}] Failed to DM Discord user ${userId}: ${(err as Error).message}`);
+    }
+  }
+
+  private async sendDiscordExplanationToAll(jpeg: Buffer, text: string) {
+    for (const userId of this.printerConfig.discordUserIds ?? []) {
+      await this.sendDiscordDM(userId, text, jpeg);
+    }
+  }
+
+  // Reuses the same Anthropic key as the visual assessment for a cheap text
+  // classification call - interprets free-form natural language ("yeah
+  // looks fine", "nah kill it") into a clear verdict, or UNCLEAR if the
+  // reply doesn't actually answer the question.
+  private async interpretReplyWithAI(text: string): Promise<'pause' | 'continue' | 'unclear'> {
+    const apiKey = this.printerConfig.anthropicApiKey;
+    if (!apiKey) {
+      return 'unclear';
+    }
+    try {
+      const res = await fetch('https://api.anthropic.com/v1/messages', {
+        method: 'POST',
+        headers: {
+          'x-api-key': apiKey,
+          'anthropic-version': '2023-06-01',
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({
+          model: 'claude-sonnet-5',
+          max_tokens: 10,
+          messages: [
+            {
+              role: 'user',
+              content:
+                'Someone was asked whether to PAUSE or let a 3D print CONTINUE, after a possible print defect was ' +
+                `detected. They replied: "${text}". Based on this reply, respond with exactly one word: PAUSE, ` +
+                "CONTINUE, or UNCLEAR if it doesn't actually answer the question.",
+            },
+          ],
+        }),
+      });
+      if (!res.ok) {
+        return 'unclear';
+      }
+      const data = (await res.json()) as { content?: Array<{ type: string; text?: string }> };
+      const raw = data.content?.find((block) => block.type === 'text')?.text?.trim().toUpperCase();
+      if (raw?.includes('PAUSE')) {
+        return 'pause';
+      }
+      if (raw?.includes('CONTINUE')) {
+        return 'continue';
+      }
+      return 'unclear';
+    } catch {
+      return 'unclear';
+    }
+  }
+
+  // Sets up the Gateway connection once at startup - outbound only, no
+  // inbound server/webhook/public port needed at all. No-op if
+  // discordBotToken isn't configured.
+  private initializeDiscordBot() {
+    if (!this.printerConfig.discordBotToken) {
+      return;
+    }
+    this.discordClient = new DiscordClient({
+      intents: [
+        GatewayIntentBits.Guilds,
+        GatewayIntentBits.DirectMessages,
+        GatewayIntentBits.MessageContent,
+        GatewayIntentBits.DirectMessageReactions,
+      ],
+      partials: [Partials.Channel, Partials.Message, Partials.Reaction],
+    });
+
+    this.discordClient.on('ready', () => {
+      this.platform.log.info(`[${this.printerConfig.name}] Discord bot connected.`);
+    });
+    this.discordClient.on('error', (err) => {
+      this.platform.log.warn(`[${this.printerConfig.name}] Discord client error: ${err.message}`);
+    });
+    this.discordClient.on('messageCreate', (message) => void this.handleDiscordMessage(message));
+    this.discordClient.on('messageReactionAdd', (reaction, user) => void this.handleDiscordReaction(reaction, user));
+
+    this.discordClient.login(this.printerConfig.discordBotToken).catch((err: Error) => {
+      this.platform.log.warn(`[${this.printerConfig.name}] Discord login failed: ${err.message}`);
+    });
+  }
+
+  private async handleDiscordMessage(message: DiscordMessage) {
+    if (message.author.bot || message.guildId) {
+      return; // ignore the bot's own messages, and anything not a DM
+    }
+    const pending = this.pendingDiscordDecision;
+    if (!pending || pending.resolved) {
+      return;
+    }
+    const match = pending.sentTo.find((s) => s.userId === message.author.id);
+    if (!match) {
+      return;
+    }
+    const verdict = await this.interpretReplyWithAI(message.content);
+    if (verdict === 'unclear') {
+      void message
+        .reply("Sorry, I couldn't tell if that meant pause or continue - could you reply more clearly, or react with \u2705/\ud83d\uded1?")
+        .catch(() => undefined);
+      return;
+    }
+    this.resolveDiscordDecision(verdict, message.author.id, message.author.username ?? message.author.id);
+  }
+
+  private async handleDiscordReaction(
+    reaction: MessageReaction | PartialMessageReaction,
+    user: DiscordUser | PartialUser,
+  ) {
+    if (user.bot) {
+      return;
+    }
+    const pending = this.pendingDiscordDecision;
+    if (!pending || pending.resolved) {
+      return;
+    }
+    const match = pending.sentTo.find((s) => s.userId === user.id && s.messageId === reaction.message.id);
+    if (!match) {
+      return;
+    }
+    const emoji = reaction.emoji.name;
+    const displayName = 'username' in user && user.username ? user.username : user.id;
+    if (emoji === '\u2705') {
+      this.resolveDiscordDecision('continue', user.id, displayName);
+    } else if (emoji === '\ud83d\uded1') {
+      this.resolveDiscordDecision('pause', user.id, displayName);
+    }
+  }
+
+
+  // Sends the snapshot to Anthropic's Messages API using your own API key -
+  // a direct outbound call, same trust model as every other third-party API
+  // this plugin already talks to (GitHub, Pingie). In auto-pause mode, the
+  // prompt additionally asks for a structured, machine-parseable verdict
+  // line (VERDICT: PAUSE / VERDICT: CONTINUE) on top of the natural-language
+  // explanation, so the response can be safely acted on rather than trying
+  // to infer intent from free-form prose. Returns undefined/no verdict on
+  // any failure - the underlying notification is never blocked by this, and
+  // a failed/unparseable response never triggers a pause (fails toward
+  // inaction, not toward autonomous action).
+  private async assessSpaghettiWithAI(
+    jpeg: Buffer,
+    wantsVerdict: boolean,
+  ): Promise<{ text?: string; verdict?: 'pause' | 'continue' }> {
+    const apiKey = this.printerConfig.anthropicApiKey;
+    if (!apiKey) {
+      this.platform.log.warn(
+        `[${this.printerConfig.name}] AI spaghetti assessment is on but anthropicApiKey isn't set - skipping.`,
+      );
+      return {};
+    }
+    const verdictInstruction = wantsVerdict
+      ? ' After your explanation, on its own final line, write exactly "VERDICT: PAUSE" if this print should be ' +
+        'paused, or exactly "VERDICT: CONTINUE" if it looks fine to keep running - this line will be parsed ' +
+        'programmatically to actually pause the printer, so it must be exactly one of those two strings, nothing else.'
+      : '';
+    try {
+      const res = await fetch('https://api.anthropic.com/v1/messages', {
+        method: 'POST',
+        headers: {
+          'x-api-key': apiKey,
+          'anthropic-version': '2023-06-01',
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({
+          model: 'claude-sonnet-5',
+          max_tokens: 250,
+          messages: [
+            {
+              role: 'user',
+              content: [
+                { type: 'image', source: { type: 'base64', media_type: 'image/jpeg', data: jpeg.toString('base64') } },
+                {
+                  type: 'text',
+                  text:
+                    "This is a snapshot from a 3D printer's chamber camera. The printer's own firmware just flagged " +
+                    'a possible "spaghetti" failure (filament detached from the model, printing loose in open air). ' +
+                    'Based on what you can actually see in this image, give a brief (2-3 sentence), direct assessment: ' +
+                    'does this look like a genuine failure worth stopping the print for, or does it look like it might ' +
+                    'still be salvageable?' +
+                    verdictInstruction,
+                },
+              ],
+            },
+          ],
+        }),
+      });
+      if (!res.ok) {
+        const body = await res.text().catch(() => '');
+        this.platform.log.warn(`[${this.printerConfig.name}] Anthropic API call failed (${res.status}): ${body}`);
+        return {};
+      }
+      const data = (await res.json()) as { content?: Array<{ type: string; text?: string }> };
+      const rawText = data.content?.find((block) => block.type === 'text')?.text?.trim();
+      if (!rawText) {
+        return {};
+      }
+      if (!wantsVerdict) {
+        return { text: rawText };
+      }
+      const match = rawText.match(/VERDICT:\s*(PAUSE|CONTINUE)\s*$/i);
+      if (!match) {
+        this.platform.log.warn(
+          `[${this.printerConfig.name}] AI response didn't include a parseable verdict line - not pausing. Raw: ${rawText}`,
+        );
+        return { text: rawText };
+      }
+      const verdict = match[1].toUpperCase() === 'PAUSE' ? 'pause' : 'continue';
+      const text = rawText.slice(0, match.index).trim();
+      return { text, verdict };
+    } catch (err) {
+      this.platform.log.warn(`[${this.printerConfig.name}] Anthropic API error: ${(err as Error).message}`);
+      return {};
+    }
   }
 
   private async captureSnapshotFromCameraUi(): Promise<Buffer | undefined> {
@@ -1587,11 +2126,23 @@ export class BambuPrinterAccessory {
   // Formats "now + remainingMinutes" as a clock time (24h, e.g. "14:32") for
   // the Live Activity's trailing text - a fixed time-of-day ETA alongside the
   // relative countdown the progress bar/endsIn already show.
+  // Uses Intl.DateTimeFormat with an explicit IANA time zone rather than
+  // .getHours()/.getMinutes(), which would silently depend on whatever
+  // timezone the underlying system/container thinks it's in - Docker
+  // containers very commonly default to UTC regardless of the host
+  // machine's real location. This makes the ETA correct (and genuinely
+  // DST-aware, since the absolute instant is computed first via
+  // Date.now() + remainingMinutes and only converted to a civil time once,
+  // at the very end) no matter how the host is configured.
   private formatEtaClockTime(remainingMinutes: number): string {
     const eta = new Date(Date.now() + remainingMinutes * 60_000);
-    const hours = eta.getHours().toString().padStart(2, '0');
-    const minutes = eta.getMinutes().toString().padStart(2, '0');
-    return `${hours}:${minutes}`;
+    const formatter = new Intl.DateTimeFormat('en-GB', {
+      timeZone: this.printerConfig.liveActivityTimezone ?? 'Europe/London',
+      hour: '2-digit',
+      minute: '2-digit',
+      hour12: false,
+    });
+    return formatter.format(eta);
   }
 
   // Up to 6 labeled chips for Pingie's metrics dashboard layout - visually
@@ -1599,33 +2150,53 @@ export class BambuPrinterAccessory {
   // too, as the documented fallback for older ones). A percentage value
   // ("62%") automatically draws a mini pill-bar per Pingie's own docs.
   private buildLiveActivityMetrics(): Array<{ label: string; value: string; color?: string }> {
+    const cfg = this.printerConfig;
     const metrics: Array<{ label: string; value: string; color?: string }> = [
-      { label: 'PROGRESS', value: `${this.printProgressPercent}%`, color: '#FF6600' },
+      { label: 'PROGRESS', value: `${this.printProgressPercent}%`, color: cfg.liveActivityColorProgress ?? '#FF6600' },
     ];
 
     const layerNum = this.mergedState.layer_num as number | undefined;
     const totalLayerNum = this.mergedState.total_layer_num as number | undefined;
     if (typeof layerNum === 'number' && typeof totalLayerNum === 'number' && totalLayerNum > 0) {
-      metrics.push({ label: 'LAYER', value: `${layerNum}/${totalLayerNum}` });
+      metrics.push({ label: 'LAYER', value: `${layerNum}/${totalLayerNum}`, color: cfg.liveActivityColorLayer ?? '#8E8E93' });
     }
 
     const speedName = BambuPrinterAccessory.SPEED_NAMES[this.currentSpeedLevel];
     if (speedName) {
-      metrics.push({ label: 'SPEED', value: speedName });
+      metrics.push({ label: 'SPEED', value: speedName, color: cfg.liveActivityColorSpeed ?? '#5E5CE6' });
     }
 
     if (this.currentPrintMaterials) {
-      metrics.push({ label: 'MATERIAL', value: this.currentPrintMaterials });
+      metrics.push({ label: 'MATERIAL', value: this.currentPrintMaterials, color: cfg.liveActivityColorMaterial ?? '#BF5AF2' });
     }
 
     const cost = this.printEstimatedTotalMinutes ? this.estimateCost(this.printEstimatedTotalMinutes) : undefined;
     if (cost !== undefined) {
-      metrics.push({ label: 'COST', value: `£${cost.toFixed(2)}` });
+      metrics.push({ label: 'COST', value: `£${cost.toFixed(2)}`, color: cfg.liveActivityColorCost ?? '#30D158' });
     }
 
     const remaining = this.mergedState.mc_remaining_time as number | undefined;
     if (typeof remaining === 'number' && remaining >= 0) {
-      metrics.push({ label: 'ETA', value: this.formatEtaClockTime(remaining) });
+      metrics.push({ label: 'ETA', value: this.formatEtaClockTime(remaining), color: cfg.liveActivityColorEta ?? '#0A84FF' });
+    }
+
+    // AI Auto-Pause status - only shown if the feature is actually
+    // configured (irrelevant noise otherwise). Pingie's dashboard has a hard
+    // cap of 6 chips, and everything above already fills that when fully
+    // available - LAYER is dropped first to make room, since it's the most
+    // redundant with the percentage PROGRESS already shows.
+    if (cfg.enableAiAutoPauseOnSpaghetti) {
+      if (metrics.length >= 6) {
+        const layerIndex = metrics.findIndex((m) => m.label === 'LAYER');
+        if (layerIndex !== -1) {
+          metrics.splice(layerIndex, 1);
+        }
+      }
+      metrics.push({
+        label: 'AI PAUSE',
+        value: this.aiAutoPauseSwitchOn ? 'ON' : 'OFF',
+        color: this.aiAutoPauseSwitchOn ? '#FF3B30' : '#8E8E93',
+      });
     }
 
     return metrics.slice(0, 6); // hard cap, matching Pingie's documented max
@@ -1951,8 +2522,7 @@ export class BambuPrinterAccessory {
             symbol: this.printerConfig.liveActivitySymbol ?? 'printer.fill',
             endsIn: typeof remaining === 'number' && remaining >= 0 ? remaining * 60 : undefined,
             body: this.buildLiveActivityBodyLine(),
-            trailing: typeof remaining === 'number' && remaining >= 0 ? this.formatEtaClockTime(remaining) : undefined,
-            metrics: this.buildLiveActivityMetrics(),
+                metrics: this.buildLiveActivityMetrics(),
           });
         }
       }
@@ -2087,14 +2657,30 @@ export class BambuPrinterAccessory {
     // Fault/error alert - a nonzero print_error or any active hms entries means
     // something needs attention. The "Inspecting first layer" hms code is
     // pulled out separately below since it's informational, not a fault.
+    // Spaghetti detection is also pulled out separately - it gets its own
+    // dedicated notification with a live snapshot (and optional AI
+    // assessment) instead of being folded into the generic fault message,
+    // since a torn-loose print deserves more than a one-line HMS description.
     const printError = this.mergedState.print_error as number | undefined;
     const hms = this.mergedState.hms as Array<{ attr?: number; code?: number }> | undefined;
     const hmsEntries = Array.isArray(hms) ? hms : [];
     const firstLayerCheckEntries = hmsEntries.filter(
       (e) => this.decodeHmsCode(e) === BambuPrinterAccessory.FIRST_LAYER_CHECK_HMS_CODE,
     );
+    const spaghettiEntries = hmsEntries.filter(
+      (e) => this.decodeHmsCode(e) === BambuPrinterAccessory.SPAGHETTI_HMS_CODE,
+    );
+    // Real-world confirmed: a spaghetti defect can also surface as a
+    // print_error (a separate code space from the HMS array), and this is
+    // what actually fired for a real user - the HMS-only check above missed
+    // it entirely, silently falling through to the generic Fault message.
+    const printErrorIsSpaghetti = printError
+      ? BambuPrinterAccessory.SPAGHETTI_PRINT_ERROR_CODES.includes(this.hexKeyForCode(printError))
+      : false;
     const realHmsEntries = hmsEntries.filter(
-      (e) => this.decodeHmsCode(e) !== BambuPrinterAccessory.FIRST_LAYER_CHECK_HMS_CODE,
+      (e) =>
+        this.decodeHmsCode(e) !== BambuPrinterAccessory.FIRST_LAYER_CHECK_HMS_CODE &&
+        this.decodeHmsCode(e) !== BambuPrinterAccessory.SPAGHETTI_HMS_CODE,
     );
 
     // First layer check - informational only, own low-key notification, no
@@ -2114,7 +2700,23 @@ export class BambuPrinterAccessory {
       }
     }
 
-    const faultNow = Boolean(printError && printError !== 0) || realHmsEntries.length > 0;
+    // Spaghetti detection - always a separate push regardless of Live
+    // Activity mode, same as Fault/Filament/Connection-lost, since this is
+    // squarely an error-category event, not something to fold into a
+    // progress tile. Catches either signal (HMS or print_error).
+    const spaghettiActive = spaghettiEntries.length > 0 || printErrorIsSpaghetti;
+    if (spaghettiActive !== this.spaghettiActive) {
+      this.spaghettiActive = spaghettiActive;
+      if (spaghettiActive) {
+        void this.handleSpaghettiDetected();
+      }
+    }
+
+    // Excludes a spaghetti-matching print_error from the generic fault count
+    // too, same as the HMS codes above - otherwise this would fire BOTH the
+    // generic "🚨 Printer fault" push AND the dedicated spaghetti one for
+    // the exact same event.
+    const faultNow = Boolean(printError && printError !== 0 && !printErrorIsSpaghetti) || realHmsEntries.length > 0;
     if (faultNow !== this.faultPresent) {
       this.faultPresent = faultNow;
       const description = printError ? this.describeError(printError) : undefined;
@@ -2199,6 +2801,19 @@ export class BambuPrinterAccessory {
       this.currentPrintMaterials = undefined;
       this.cachedFilamentUsage = undefined;
 
+      // Real safety reset, not just cosmetic: AI Auto-Pause must be
+      // consciously re-enabled for every new print, even if it was left on
+      // from a previous one (or a Homebridge restart didn't happen to clear
+      // it). This is what actually enforces "per print," not just "per
+      // restart."
+      if (this.aiAutoPauseSwitchOn) {
+        this.aiAutoPauseSwitchOn = false;
+        this.aiAutoPauseSwitchService?.updateCharacteristic(this.platform.Characteristic.On, false);
+        this.platform.log.info(
+          `[${this.printerConfig.name}] AI Auto-Pause reset to off for this new print - turn it back on if you want it active.`,
+        );
+      }
+
       this.platform.log.info(`[${this.printerConfig.name}] Print started.`);
       this.startedSwitchService.updateCharacteristic(
         this.platform.Characteristic.ProgrammableSwitchEvent,
@@ -2261,7 +2876,7 @@ export class BambuPrinterAccessory {
           void this.updateLiveActivity({
             endsIn: this.printEstimatedTotalMinutes ? this.printEstimatedTotalMinutes * 60 : undefined,
             body: this.buildLiveActivityBodyLine(),
-            trailing: this.printEstimatedTotalMinutes ? this.formatEtaClockTime(this.printEstimatedTotalMinutes) : undefined,
+            metrics: this.buildLiveActivityMetrics(),
           });
         } else {
           void this.sendPingieNotificationWithSnapshot('🖨️ Print started', parts.join(' '));
@@ -2427,8 +3042,7 @@ export class BambuPrinterAccessory {
               endsIn: typeof remaining === 'number' && remaining >= 0 ? remaining * 60 : undefined,
               status: 'printing',
               body: this.buildLiveActivityBodyLine(),
-              trailing: typeof remaining === 'number' && remaining >= 0 ? this.formatEtaClockTime(remaining) : undefined,
-              metrics: this.buildLiveActivityMetrics(),
+                    metrics: this.buildLiveActivityMetrics(),
             });
           }
         }
@@ -2517,12 +3131,20 @@ export class BambuPrinterAccessory {
       return;
     }
     if (this.airPurifierTicker) {
-      clearInterval(this.airPurifierTicker);
+      clearTimeout(this.airPurifierTicker);
     }
-    const durationMinutes = this.airPurifierDurationMinutes ?? this.printerConfig.airPurifierActiveDurationMinutes ?? 60;
+    const durationMinutes = this.printerConfig.airPurifierActiveDurationMinutes ?? 45;
     this.airPurifierSecondsRemaining = durationMinutes * 60;
     this.airPurifierActive = true;
     this.pushAirPurifierState();
+
+    // Persisted to Homebridge's own durable accessory storage (survives a
+    // plugin/Homebridge restart, unlike everything else here which is
+    // in-memory only) - this is what makes the HomeKit sensor resume
+    // correctly across a restart instead of always resetting to closed,
+    // matching what the Live Activity already does for free via Apple's own
+    // client-side countdown ticking.
+    this.accessory.context.airPurifierActiveUntil = Date.now() + this.airPurifierSecondsRemaining * 1000;
 
     if (this.printerConfig.useLiveActivity) {
       void this.updateLiveActivity({
@@ -2539,57 +3161,70 @@ export class BambuPrinterAccessory {
       });
     }
 
-    this.airPurifierTicker = setInterval(() => {
-      if (this.airPurifierSecondsRemaining > 0) {
-        this.airPurifierSecondsRemaining -= 1;
-      }
-      this.airPurifierSensorService?.updateCharacteristic(
-        this.platform.Characteristic.RemainingDuration,
-        this.airPurifierSecondsRemaining,
-      );
-      if (this.airPurifierSecondsRemaining <= 0) {
-        this.stopAirPurifierWindow();
-      }
-    }, 1000);
+    // Contact Sensor is just binary open/closed - no per-second ticking
+    // needed (unlike the Valve's RemainingDuration, which this replaced).
+    // The Live Activity's endsIn still ticks its own countdown client-side
+    // regardless, so nothing is lost there.
+    this.airPurifierTicker = setTimeout(() => this.stopAirPurifierWindow(), this.airPurifierSecondsRemaining * 1000);
+  }
+
+  // Called once at accessory startup - checks Homebridge's durable storage
+  // for a window that was still active when the plugin last shut down, and
+  // resumes it for whatever time was genuinely left, rather than always
+  // defaulting to closed on every restart. If the window had already elapsed
+  // while the plugin was down, cleans up and leaves it closed.
+  private resumeAirPurifierWindowIfNeeded() {
+    if (!this.printerConfig.enableAirPurifierSensor) {
+      return;
+    }
+    const activeUntil = this.accessory.context.airPurifierActiveUntil as number | undefined;
+    if (!activeUntil) {
+      return;
+    }
+    const remainingMs = activeUntil - Date.now();
+    if (remainingMs <= 0) {
+      delete this.accessory.context.airPurifierActiveUntil;
+      return;
+    }
+    this.platform.log.info(
+      `[${this.printerConfig.name}] Resuming air purifier window after restart - ` +
+        `${Math.round(remainingMs / 60000)} minutes left.`,
+    );
+    this.airPurifierSecondsRemaining = Math.round(remainingMs / 1000);
+    this.airPurifierActive = true;
+    this.pushAirPurifierState();
+    this.airPurifierTicker = setTimeout(() => this.stopAirPurifierWindow(), remainingMs);
   }
 
   private stopAirPurifierWindow() {
     if (this.airPurifierTicker) {
-      clearInterval(this.airPurifierTicker);
+      clearTimeout(this.airPurifierTicker);
       this.airPurifierTicker = undefined;
     }
     this.airPurifierActive = false;
     this.airPurifierSecondsRemaining = 0;
+    delete this.accessory.context.airPurifierActiveUntil;
     this.pushAirPurifierState();
     this.platform.log.info(`[${this.printerConfig.name}] Air purifier window closed.`);
 
-    // Now that the purifier phase (if any) is genuinely done, actually end
-    // the Live Activity - this is the real end call that FINISH/FAILED
-    // deferred when they extended the tile into the purifying phase.
-    if (this.printerConfig.useLiveActivity) {
+    // Only end the Live Activity if nothing has since reused the tile. If a
+    // new print started during this window, Pingie's device-address upsert
+    // means it's already reusing the SAME tile to track its own progress -
+    // ending it here would kill a tile that might have hours left on a
+    // completely different print. That new print's own Finish/Failed
+    // transition will correctly end it when IT actually completes; this
+    // window's expiry has nothing to do with it at that point.
+    if (this.printerConfig.useLiveActivity && !this.currentlyOccupied) {
       void this.endLiveActivity({ status: 'done' });
     }
   }
 
   private pushAirPurifierState() {
-    if (!this.airPurifierSensorService) {
-      return;
-    }
-    this.airPurifierSensorService.updateCharacteristic(
-      this.platform.Characteristic.Active,
+    this.airPurifierSensorService?.updateCharacteristic(
+      this.platform.Characteristic.ContactSensorState,
       this.airPurifierActive
-        ? this.platform.Characteristic.Active.ACTIVE
-        : this.platform.Characteristic.Active.INACTIVE,
-    );
-    this.airPurifierSensorService.updateCharacteristic(
-      this.platform.Characteristic.InUse,
-      this.airPurifierActive
-        ? this.platform.Characteristic.InUse.IN_USE
-        : this.platform.Characteristic.InUse.NOT_IN_USE,
-    );
-    this.airPurifierSensorService.updateCharacteristic(
-      this.platform.Characteristic.RemainingDuration,
-      this.airPurifierSecondsRemaining,
+        ? this.platform.Characteristic.ContactSensorState.CONTACT_NOT_DETECTED
+        : this.platform.Characteristic.ContactSensorState.CONTACT_DETECTED,
     );
   }
 
@@ -2607,9 +3242,10 @@ export class BambuPrinterAccessory {
       clearTimeout(this.speedCommandCorrectionTimer);
     }
     if (this.airPurifierTicker) {
-      clearInterval(this.airPurifierTicker);
+      clearTimeout(this.airPurifierTicker);
     }
     this.stopRefreshTimer();
     this.client?.end(true);
+    this.discordClient?.destroy();
   }
 }

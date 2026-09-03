@@ -18,85 +18,89 @@
           "type": "object",
           "properties": {
             "name": {
-              "title": "Name",
+              "title": "Printer Name",
               "type": "string",
               "default": "X1 Carbon",
-              "required": true
+              "required": true,
+              "description": "Shown in Home app and every notification."
             },
             "ipAddress": {
               "title": "IP Address",
               "type": "string",
               "required": true,
-              "description": "Must be static or DHCP-reserved - the plugin connects directly to this address."
+              "description": "Must be static or DHCP-reserved."
             },
             "serialNumber": {
               "title": "Serial Number",
               "type": "string",
               "required": true,
-              "description": "Settings > General on the printer, or the Bambu Handy app device info."
+              "description": "Found on the printer or in Bambu Studio."
             },
             "lanAccessCode": {
               "title": "LAN Access Code",
               "type": "string",
               "required": true,
-              "description": "Settings (cog icon) > General on the printer's touchscreen, shown in green."
+              "description": "Settings \u2192 General on the touchscreen."
             },
             "mqttPort": {
               "title": "MQTT Port",
               "type": "number",
-              "default": 8883
+              "default": 8883,
+              "description": "Leave as 8883 unless you know otherwise."
             },
             "mqttUsername": {
               "title": "MQTT Username",
               "type": "string",
-              "default": "bblp"
+              "default": "bblp",
+              "description": "Always \"bblp\" on stock firmware."
             },
             "rejectUnauthorized": {
               "title": "Verify TLS Certificate",
               "type": "boolean",
               "default": false,
-              "description": "Bambu printers use a self-signed certificate, so this should normally stay off."
+              "description": "Leave off \u2014 the printer's certificate is self-signed."
             },
             "refreshIntervalSeconds": {
-              "title": "Full State Refresh Interval (seconds)",
+              "title": "Full State Refresh Interval (s)",
               "type": "number",
               "default": 0,
-              "description": "Off by default (0). The printer already pushes updates continuously on its own, and a full refresh already happens on every (re)connect - this periodic version only guards against a message silently vanishing while the connection stays up, a rare edge case. Set a positive value only if you want that extra safety net back."
+              "description": "Extra safety-net poll on top of normal updates. 0 disables it \u2014 recommended."
             },
             "reconnectDelaySeconds": {
-              "title": "Reconnect Delay (seconds)",
+              "title": "Reconnect Base Delay (s)",
               "type": "number",
               "default": 10,
-              "description": "Base delay before the first retry - doubles with each consecutive failure (exponential backoff) up to reconnectMaxDelaySeconds, rather than retrying at a constant rate forever."
+              "description": "Starting delay before the first retry after a dropped connection."
             },
             "reconnectMaxDelaySeconds": {
-              "title": "Reconnect Max Delay (seconds)",
+              "title": "Reconnect Max Delay (s)",
               "type": "number",
               "default": 300,
-              "description": "Ceiling for the exponential backoff above - retries won't wait longer than this even during an extended outage."
+              "description": "Retry delay is capped here during a long outage."
             },
             "enableNetworkPresenceCheck": {
-              "title": "Ping-gate reconnects (off by default)",
+              "title": "Ping Before Reconnecting",
               "type": "boolean",
               "default": false,
-              "description": "Pings the printer before attempting a real MQTT connection - skips the attempt entirely if it's not even reachable at the network layer. Falls back to reconnecting normally if the ping check itself doesn't work in your environment (some minimal Docker containers lack a working ping binary)."
+              "description": "Skips a reconnect attempt entirely if the printer isn\u2019t even on the network."
             },
             "presenceCheckIntervalSeconds": {
-              "title": "Presence Check Interval (seconds)",
+              "title": "Presence Check Interval (s)",
               "type": "number",
-              "default": 30
+              "default": 30,
+              "description": "How often to ping when the above is enabled."
             },
             "mqttReconnectAlertThreshold": {
-              "title": "Connection Lost Alert Threshold (attempts)",
+              "title": "Connection-Lost Alert Threshold",
               "type": "number",
               "default": 5,
-              "description": "Sends a \"check the printer\" push after this many consecutive failed reconnect attempts, then again every that-many attempts while it stays down. Set to 0 to disable."
+              "description": "Sends a push after this many failed reconnect attempts in a row."
             },
             "useLiveActivity": {
-              "title": "Use a Live Activity instead of Started/Progress/Finished pushes",
+              "title": "Use a Live Activity",
               "type": "boolean",
               "default": false,
-              "description": "One persistent, updating Lock Screen tile instead of a burst of separate notifications. Requires at least one entry in liveActivityDevices below - this is a per-device Pingie feature, a different credential from the group ID/token used for regular pushes. Filament cost and Electricity cost notifications still send separately either way."
+              "description": "One persistent Lock Screen tile instead of separate push notifications."
             },
             "liveActivityDevices": {
               "title": "Live Activity Devices",
@@ -114,95 +118,120 @@
                     "type": "string"
                   }
                 },
-                "required": ["deviceId", "deviceToken"]
+                "required": [
+                  "deviceId",
+                  "deviceToken"
+                ]
               },
-              "description": "Add one row per device you want the Live Activity tile to appear on. Pingie's Live Activity API has no group concept - the plugin sends one separate update to each device listed here, so the tile can appear on multiple phones even though Pingie itself only supports addressing a single device per call."
+              "description": "One row per phone you want the tile to appear on."
             },
             "liveActivitySymbol": {
-              "title": "Live Activity Icon (SF Symbol name)",
+              "title": "Icon (SF Symbol name)",
               "type": "string",
-              "default": "printer.fill"
+              "default": "printer.fill",
+              "description": "Shown on the tile while printing."
             },
             "liveActivityTint": {
-              "title": "Live Activity Accent Color",
+              "title": "Accent Color",
               "type": "string",
-              "default": "#FF6600"
+              "default": "#FF6600",
+              "description": "Colors the progress bar, icon, and countdown text together."
             },
             "liveActivityKeepForSeconds": {
-              "title": "Finished Tile Lingers For (seconds)",
+              "title": "Finished Tile Lingers For (s)",
               "type": "number",
               "default": 300,
-              "description": "How long the completed tile stays visible before clearing. 0 clears immediately."
+              "description": "How long the completed tile stays up before clearing."
             },
             "liveActivityUpdateIntervalPercent": {
-              "title": "Live Activity Update Interval (%)",
+              "title": "Update Interval (%)",
               "type": "number",
               "default": 1,
-              "description": "Decoupled from the push-notification interval below - Live Activity updates are lightweight, so there's no real reason to throttle it the same way. Default updates on every 1% for a smoothly progressing tile."
+              "description": "How often the tile refreshes. Lightweight, so 1% is fine."
             },
             "enableRequestTopicSniffing": {
-              "title": "Enable AMS ID sniffer (diagnostic, off by default)",
+              "title": "\u26a0\ufe0f AMS ID Sniffer (Diagnostic)",
               "type": "boolean",
               "default": false,
-              "description": "Subscribes to the /request topic to discover values like the AMS drying ams_id by watching Bambu Studio's own commands. Turn on temporarily while hunting for a value, then back off - keeps MQTT traffic minimal otherwise."
+              "description": "OFF BY DEFAULT. Subscribes to the printer\u2019s /request MQTT topic to watch commands sent by OTHER clients (Bambu Studio, Handy, the touchscreen) \u2014 used purely to discover values like the AMS drying ID by watching Studio\u2019s own \"Dry\" button. This is a non-standard use of the MQTT connection beyond this plugin\u2019s normal traffic. Turn on only while actively hunting for a value, then turn back off \u2014 leaving it on permanently adds unnecessary ongoing message traffic for no benefit once you\u2019ve found what you needed."
             },
             "activeStates": {
-              "title": "gcode_state values treated as \"occupied\"",
+              "title": "\"Occupied\" gcode States",
               "type": "array",
               "items": {
                 "type": "string"
               },
-              "default": ["RUNNING", "PREPARE", "PAUSE", "SLICING"]
+              "default": [
+                "RUNNING",
+                "PREPARE",
+                "PAUSE",
+                "SLICING"
+              ],
+              "description": "Which printer states count as actively printing."
             },
             "filamentRunoutErrorCodes": {
-              "title": "print_error codes treated as \"filament run-out\"",
+              "title": "Filament Run-Out Error Codes",
               "type": "array",
               "items": {
                 "type": "string"
               },
-              "default": ["0300_8015", "0300_8004", "0700_8011", "0701_8011", "0702_8011", "0703_8011", "1200_8011", "1201_8011", "1202_8011", "1203_8011", "12FF_8011", "07FF_8011"],
-              "description": "Pre-filled from a community code mapping covering the external-spool and each AMS-slot run-out variant. Add more if the Homebridge log shows an unmatched pause code on a real run-out."
+              "default": [
+                "0300_8015",
+                "0300_8004",
+                "0700_8011",
+                "0701_8011",
+                "0702_8011",
+                "0703_8011",
+                "1200_8011",
+                "1201_8011",
+                "1202_8011",
+                "1203_8011",
+                "12FF_8011",
+                "07FF_8011"
+              ],
+              "description": "print_error codes treated as a genuine run-out. Defaults cover known cases."
             },
             "pingieGroupId": {
-              "title": "Pingie Notify! Group ID",
+              "title": "Pingie Group ID",
               "type": "string",
-              "description": "Starts with GRP. Leave both Pingie fields blank to disable notifications."
+              "description": "From the Notify! app\u2019s Group settings."
             },
             "pingieGroupToken": {
-              "title": "Pingie Notify! Group Token",
-              "type": "string"
+              "title": "Pingie Group Token",
+              "type": "string",
+              "description": "From the Notify! app\u2019s Group settings."
             },
             "pingieIconUrl": {
-              "title": "Pingie Notification Icon URL (optional)",
+              "title": "Notification Icon URL",
               "type": "string",
-              "description": "Small circular sender icon shown next to the title."
+              "description": "Small icon shown on every push. Optional."
             },
             "pingieImageUrl": {
-              "title": "Pingie Notification Image URL (optional)",
+              "title": "Notification Image URL",
               "type": "string",
-              "description": "Larger hero image shown when the notification is expanded. JPEG/PNG/GIF, under 10MB, must be HTTPS."
+              "description": "Larger image shown when a push is expanded. Optional."
             },
             "averagePrintWattage": {
               "title": "Average Print Power Draw (W)",
               "type": "number",
-              "description": "Used only for cost estimates. Leave blank to get duration-only notifications."
+              "description": "Used to estimate electricity cost. Leave blank to skip cost estimates."
             },
             "electricityRatePencePerKwh": {
               "title": "Electricity Rate (pence/kWh)",
               "type": "number",
-              "description": "Used only for cost estimates. Leave blank to get duration-only notifications."
+              "description": "Your actual tariff rate."
             },
             "progressNotificationIntervalPercent": {
-              "title": "Progress Notification Interval (%)",
+              "title": "Progress Push Interval (%)",
               "type": "number",
               "default": 5,
-              "description": "Sends a notification every N percent complete, with time remaining. Set to 0 to disable."
+              "description": "How often a \"Print progress\" push fires. Set 0 to disable."
             },
             "startNotificationDelaySeconds": {
-              "title": "Print Started Notification Delay (seconds)",
+              "title": "Start Push Delay (seconds)",
               "type": "number",
               "default": 30,
-              "description": "Delays the \"Print started\" push (not the HomeKit switch) so the time estimate has a chance to populate first."
+              "description": "Waits this long so the time estimate is ready first."
             },
             "filamentPrices": {
               "title": "Filament Prices",
@@ -216,62 +245,131 @@
                     "description": "Must match the type string exactly as it appears in your sliced files (e.g. PLA, PETG, ABS, PLA-CF) - case-sensitive."
                   },
                   "pricePerKg": {
-                    "title": "Price per kg (£)",
+                    "title": "Price per kg (\u00a3)",
                     "type": "number"
                   }
                 },
-                "required": ["material", "pricePerKg"]
+                "required": [
+                  "material",
+                  "pricePerKg"
+                ]
               },
-              "description": "Add one row per material. A material not listed here still shows its weight in notifications, just without a cost."
+              "description": "One row per material \u2014 add a Material and its Price per kg."
             },
             "progressDisplayMode": {
               "title": "Progress Display",
               "type": "string",
-              "enum": ["fan", "countdown", "both"],
+              "enum": [
+                "fan",
+                "countdown",
+                "both"
+              ],
               "default": "both",
-              "description": "\"fan\" = Progress % slider only. \"countdown\" = Light Sensor showing MM.SS time remaining only. \"both\" = both accessories. Switching modes automatically removes the tile(s) no longer in use."
+              "description": "Which progress-style accessory(ies) to show in Home app."
             },
             "showTemperatureSensors": {
-              "title": "Show bed/nozzle/chamber temperature sensors",
+              "title": "Show Temperature Sensors",
               "type": "boolean",
               "default": false,
-              "description": "Off by default. Adds three Temperature Sensor accessories to Home app."
+              "description": "Adds Bed/Nozzle/Chamber Temperature Sensor accessories."
             },
             "lightAccessoryType": {
               "title": "Chamber Light Accessory Type",
               "type": "string",
-              "enum": ["lightbulb", "switch"],
+              "enum": [
+                "lightbulb",
+                "switch"
+              ],
               "default": "lightbulb",
-              "description": "\"switch\" avoids Siri's \"turn off all the lights\" sweeping up the chamber light during a print - Siri specifically targets the Lightbulb category. Identical on/off behavior either way. Switching modes automatically removes the tile no longer in use."
+              "description": "Use \"switch\" so Siri\u2019s \"turn off all the lights\" doesn\u2019t catch it mid-print."
             },
             "enableAirPurifierSensor": {
               "title": "Air Purifier Trigger Sensor",
               "type": "boolean",
               "default": false,
-              "description": "Off by default. A Valve accessory that goes active the moment a print finishes (or fails/cancels), for automating something like an air purifier alongside the printer. The duration is also adjustable directly from the Home app, not just here."
+              "description": "A Contact Sensor that opens after a print finishes, for automating a real air purifier."
             },
             "airPurifierActiveDurationMinutes": {
-              "title": "Air Purifier Active Duration (minutes)",
+              "title": "Active Duration (minutes)",
               "type": "number",
-              "default": 60,
-              "description": "Initial default only - once adjusted via the Home app (the Valve's SetDuration control), that value takes over until the next Homebridge restart."
+              "default": 45,
+              "description": "How long the sensor stays open after a print finishes."
             },
             "liveActivityPurifierSymbol": {
-              "title": "Live Activity Purifier Icon (SF Symbol name)",
+              "title": "Live Activity Icon (Purifying)",
               "type": "string",
               "default": "aqi.medium",
-              "description": "Shown on the Live Activity tile during the purifying phase. Confirmed to exist in Apple's SF Symbols catalogue (unlike the earlier \"wind\" default)."
+              "description": "Shown on the tile during the purifying phase."
             },
             "liveActivityPurifierTint": {
-              "title": "Live Activity Purifier Accent Color",
+              "title": "Live Activity Accent (Purifying)",
               "type": "string",
               "default": "#0A84FF",
-              "description": "Distinct from the main printing-phase tint, so the purifying phase is visually distinguishable at a glance, not just by text."
+              "description": "Distinct from the printing-phase color."
+            },
+            "liveActivityColorProgress": {
+              "title": "Chip Color: Progress",
+              "type": "string",
+              "format": "color",
+              "default": "#FF6600"
+            },
+            "liveActivityColorLayer": {
+              "title": "Chip Color: Layer",
+              "type": "string",
+              "format": "color",
+              "default": "#8E8E93"
+            },
+            "liveActivityColorSpeed": {
+              "title": "Chip Color: Speed",
+              "type": "string",
+              "format": "color",
+              "default": "#5E5CE6"
+            },
+            "liveActivityColorMaterial": {
+              "title": "Chip Color: Material",
+              "type": "string",
+              "format": "color",
+              "default": "#BF5AF2"
+            },
+            "liveActivityColorCost": {
+              "title": "Chip Color: Cost",
+              "type": "string",
+              "format": "color",
+              "default": "#30D158"
+            },
+            "liveActivityColorEta": {
+              "title": "Chip Color: ETA",
+              "type": "string",
+              "format": "color",
+              "default": "#0A84FF"
+            },
+            "liveActivityTimezone": {
+              "title": "ETA Time Zone",
+              "type": "string",
+              "default": "Europe/London",
+              "description": "IANA name, e.g. Europe/London. Keeps the ETA correct through BST/DST."
+            },
+            "enableAiSpaghettiAssessment": {
+              "title": "AI Spaghetti Assessment",
+              "type": "boolean",
+              "default": false,
+              "description": "Sends the snapshot to Anthropic for a text opinion. Advisory only \u2014 never acts on the printer."
+            },
+            "anthropicApiKey": {
+              "title": "Anthropic API Key",
+              "type": "string",
+              "description": "Your own key from console.anthropic.com."
+            },
+            "enableAiAutoPauseOnSpaghetti": {
+              "title": "\u26a0\ufe0f AI Autonomous Pause/Resume",
+              "type": "boolean",
+              "default": false,
+              "description": "OFF BY DEFAULT. This only controls whether the \"AI Auto-Pause\" HomeKit switch exists - the switch itself is the real gate, and it resets to off automatically at the start of every new print, so it has to be manually turned on again each time you actually want it active. When on, an AI model\u2019s judgment from a single photo can autonomously PAUSE or RESUME the print - more autonomous authority than Bambu\u2019s own first-party AI monitoring exercises (their system only ever flags, it never acts). AI vision judgment from one photo is fallible in both directions: wrongly pausing interrupts a fine print, wrongly resuming lets a genuine failure keep running unsupervised. Only ever pauses/resumes, never a full cancel/abort, and fails toward doing nothing if the API call fails or the response can\u2019t be parsed. Requires anthropicApiKey above."
             },
             "amsId": {
-              "title": "AMS 2 Pro Drying ID (experimental)",
+              "title": "AMS 2 Pro Drying ID",
               "type": "number",
-              "description": "Required to enable AMS Auto-Dry - no default, no auto-detection. Doesn't follow simple 0-3 numbering; the one confirmed working example used 131. Leave blank to skip this feature entirely."
+              "description": "OFF BY DEFAULT \u2014 marked experimental because real, unresolved protocol unknowns remain, not just as a formality. Controls a physical heater inside the AMS 2 Pro automatically based on a humidity threshold. Two genuine open questions: the drying command\u2019s AMS ID doesn\u2019t follow the printer\u2019s normal 0-3 numbering (found by community reverse-engineering, not officially documented), and the humidity scale itself isn\u2019t confirmed to be a true percentage \u2014 even an actively-maintained community integration has an open, unanswered question about this. Defaults to Off between Homebridge restarts deliberately, since this is a heater. Test cautiously with an empty AMS before trusting it unattended."
             },
             "amsHumidityUnitIndex": {
               "title": "AMS Humidity Unit Index",
@@ -291,7 +389,7 @@
               "default": 40
             },
             "amsDryTargetTemp": {
-              "title": "AMS Dry Target Temp (°C)",
+              "title": "AMS Dry Target Temp (\u00b0C)",
               "type": "number",
               "default": 45,
               "description": "Clamped to a minimum of 45 - the reverse-engineered command reportedly no-ops below that."
@@ -303,15 +401,15 @@
               "description": "Hardware-level cutoff independent of this plugin's own stop command, in case that never arrives (e.g. connection drop)."
             },
             "includeCameraSnapshot": {
-              "title": "Include a live camera snapshot in notifications",
+              "title": "Include Live Camera Snapshot",
               "type": "boolean",
               "default": false,
-              "description": "Pulls the snapshot from camera.ui's own API (not a direct connection to the printer), then uploads it to GitHub for Pingie to fetch. Adds a couple seconds of latency per notification."
+              "description": "OFF BY DEFAULT. Attaches a live camera.ui photo to notifications. Worth knowing before enabling: this plugin previously caused a real connection-contention incident during testing \u2014 the printer\u2019s camera only supports one active connection at a time, and this feature competes with camera.ui\u2019s own continuous connection for it. If you already run camera.ui with continuous recording/prebuffering/HKSV enabled, adding this on top raised real stability concerns for at least one user in practice, not just in theory. Worth watching printer health closely after enabling, especially during a print you actually care about."
             },
             "cameraUiBaseUrl": {
               "title": "camera.ui Base URL",
               "type": "string",
-              "description": "e.g. http://192.168.0.178:8081 - no trailing slash."
+              "description": "e.g. http://192.168.0.178:8081"
             },
             "cameraUiUsername": {
               "title": "camera.ui Username",
@@ -324,12 +422,12 @@
             "cameraUiCameraName": {
               "title": "camera.ui Camera Name",
               "type": "string",
-              "description": "Must match the camera's exact name as registered inside camera.ui - not necessarily this printer's name here."
+              "description": "The exact camera name as configured in camera.ui."
             },
             "githubToken": {
               "title": "GitHub Personal Access Token",
               "type": "string",
-              "description": "Fine-grained PAT scoped to only \"Contents: read and write\" on the repo below - not a broad classic token."
+              "description": "Used to host snapshot/preview images publicly."
             },
             "githubOwner": {
               "title": "GitHub Username/Org",
@@ -338,34 +436,214 @@
             "githubRepo": {
               "title": "GitHub Repo",
               "type": "string",
-              "description": "Just the repo name, not the full URL. Must be public so raw.githubusercontent.com URLs work without auth."
+              "description": "Must be public."
             },
             "githubSnapshotPath": {
               "title": "Snapshot File Path in Repo",
               "type": "string",
               "default": "images/latest-print.jpg",
-              "description": "This one file gets overwritten each time, rather than accumulating a new file per notification."
+              "description": "This one file is overwritten each time."
             },
             "includePrintPreviewImage": {
-              "title": "Use the sliced file's rendered preview as the notification icon",
+              "title": "Use Sliced-File Preview Image",
               "type": "boolean",
               "default": false,
-              "description": "Extracts the slicer-rendered plate thumbnail from the sliced 3MF (same image the touchscreen shows) via FTP - not the camera. Preferred over the camera snapshot if both are enabled. Not usable with Live Activities (SF Symbol icon only, no custom image support). Uses the same GitHub fields above."
+              "description": "Uses the slicer-rendered plate thumbnail instead of a live photo."
             },
             "githubPreviewImagePath": {
               "title": "Preview Image File Path in Repo",
               "type": "string",
               "default": "images/latest-print-preview.png",
-              "description": "Separate file from the camera snapshot path above, so the two features don't overwrite each other if both are ever enabled."
+              "description": "Separate path so it doesn\u2019t collide with the snapshot above."
             },
             "githubBranch": {
               "title": "GitHub Branch",
               "type": "string",
               "default": "main"
+            },
+            "discordBotToken": {
+              "title": "Discord Bot Token",
+              "type": "string",
+              "description": "From the Discord Developer Portal. Connects outbound only - no public server or webhook needed."
+            },
+            "discordUserIds": {
+              "title": "Discord User IDs",
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "description": "One row per person to DM about spaghetti defects. Right-click a user in Discord (Developer Mode enabled) and Copy User ID."
             }
           }
         }
       }
     }
-  }
+  },
+  "layout": [
+    "name",
+    {
+      "type": "array",
+      "key": "printers",
+      "items": [
+        "printers[].name",
+        "printers[].ipAddress",
+        "printers[].serialNumber",
+        "printers[].lanAccessCode",
+        "printers[].mqttPort",
+        "printers[].mqttUsername",
+        "printers[].rejectUnauthorized",
+        {
+          "type": "fieldset",
+          "title": "Notifications (Pingie)",
+          "expandable": true,
+          "expanded": true,
+          "items": [
+            "printers[].pingieGroupId",
+            "printers[].pingieGroupToken",
+            "printers[].pingieIconUrl",
+            "printers[].pingieImageUrl",
+            "printers[].progressNotificationIntervalPercent",
+            "printers[].startNotificationDelaySeconds"
+          ],
+          "description": "Push notification setup and timing."
+        },
+        {
+          "type": "fieldset",
+          "title": "Cost Tracking",
+          "expandable": true,
+          "expanded": false,
+          "items": [
+            "printers[].averagePrintWattage",
+            "printers[].electricityRatePencePerKwh",
+            "printers[].filamentPrices"
+          ],
+          "description": "Optional electricity and filament cost estimates in notifications."
+        },
+        {
+          "type": "fieldset",
+          "title": "HomeKit Display Options",
+          "expandable": true,
+          "expanded": false,
+          "items": [
+            "printers[].progressDisplayMode",
+            "printers[].showTemperatureSensors",
+            "printers[].lightAccessoryType",
+            "printers[].activeStates"
+          ],
+          "description": "Which accessories show up in Home app."
+        },
+        {
+          "type": "fieldset",
+          "title": "Connection Reliability",
+          "expandable": true,
+          "expanded": false,
+          "items": [
+            "printers[].refreshIntervalSeconds",
+            "printers[].reconnectDelaySeconds",
+            "printers[].reconnectMaxDelaySeconds",
+            "printers[].enableNetworkPresenceCheck",
+            "printers[].presenceCheckIntervalSeconds",
+            "printers[].mqttReconnectAlertThreshold"
+          ],
+          "description": "Reconnect behavior and traffic tuning \u2014 sensible defaults, rarely need changing."
+        },
+        {
+          "type": "fieldset",
+          "title": "Live Activity (Lock Screen tile)",
+          "expandable": true,
+          "expanded": false,
+          "items": [
+            "printers[].useLiveActivity",
+            "printers[].liveActivityDevices",
+            "printers[].liveActivitySymbol",
+            "printers[].liveActivityTint",
+            "printers[].liveActivityKeepForSeconds",
+            "printers[].liveActivityUpdateIntervalPercent",
+            "printers[].liveActivityTimezone",
+            "printers[].liveActivityColorProgress",
+            "printers[].liveActivityColorLayer",
+            "printers[].liveActivityColorSpeed",
+            "printers[].liveActivityColorMaterial",
+            "printers[].liveActivityColorCost",
+            "printers[].liveActivityColorEta"
+          ],
+          "description": "One persistent updating tile instead of separate push notifications."
+        },
+        {
+          "type": "fieldset",
+          "title": "Air Purifier Automation",
+          "expandable": true,
+          "expanded": false,
+          "items": [
+            "printers[].enableAirPurifierSensor",
+            "printers[].airPurifierActiveDurationMinutes",
+            "printers[].liveActivityPurifierSymbol",
+            "printers[].liveActivityPurifierTint"
+          ],
+          "description": "Trigger sensor for automating a real air purifier after a print."
+        },
+        {
+          "type": "fieldset",
+          "title": "AI Spaghetti Assessment & Discord",
+          "expandable": true,
+          "expanded": false,
+          "items": [
+            "printers[].enableAiSpaghettiAssessment",
+            "printers[].anthropicApiKey",
+            "printers[].discordBotToken",
+            "printers[].discordUserIds"
+          ],
+          "description": "Optional AI opinion, plus an interactive Discord bot that can ask you directly. Advisory only unless AI auto-pause (Experimental) is also on."
+        },
+        {
+          "type": "fieldset",
+          "title": "Advanced Tuning",
+          "expandable": true,
+          "expanded": false,
+          "items": [
+            "printers[].filamentRunoutErrorCodes"
+          ],
+          "description": "Rarely need changing \u2014 only touch these if you know why."
+        },
+        {
+          "type": "fieldset",
+          "title": "Preview & Snapshot Image Hosting",
+          "expandable": true,
+          "expanded": false,
+          "items": [
+            "printers[].includePrintPreviewImage",
+            "printers[].githubToken",
+            "printers[].githubOwner",
+            "printers[].githubRepo",
+            "printers[].githubSnapshotPath",
+            "printers[].githubPreviewImagePath",
+            "printers[].githubBranch"
+          ],
+          "description": "Shared GitHub hosting used by the camera snapshot and sliced-file preview features below."
+        },
+        {
+          "type": "fieldset",
+          "title": "\u26a0\ufe0f Experimental \u2014 Use With Caution",
+          "expandable": true,
+          "expanded": false,
+          "items": [
+            "printers[].includeCameraSnapshot",
+            "printers[].cameraUiBaseUrl",
+            "printers[].cameraUiUsername",
+            "printers[].cameraUiPassword",
+            "printers[].cameraUiCameraName",
+            "printers[].amsId",
+            "printers[].amsHumidityUnitIndex",
+            "printers[].amsDryStartThreshold",
+            "printers[].amsDryStopThreshold",
+            "printers[].amsDryTargetTemp",
+            "printers[].amsDryDurationHours",
+            "printers[].enableAiAutoPauseOnSpaghetti",
+            "printers[].enableRequestTopicSniffing"
+          ],
+          "description": "Real, acknowledged risk in each of these. Read before enabling."
+        }
+      ]
+    }
+  ]
 }

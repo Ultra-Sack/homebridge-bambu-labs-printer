@@ -32,29 +32,58 @@ Exposes a Bambu Lab printer to HomeKit as:
   *off by default*, only appear if `showTemperatureSensors: true` is set.
   Ranges are extended beyond HomeKit's default 0-100°C cap (nozzle up to
   350°C, bed up to 150°C) so real readings don't get silently clipped.
-- A **Valve ("Air Purifier")** — *off by default*, only appears if
-  `enableAirPurifierSensor: true` is set. Goes active the moment a print
+- A **Contact Sensor ("Air Purifier")** — *off by default*, only appears if
+  `enableAirPurifierSensor: true` is set. Opens (`NOT_DETECTED`, matching the
+  same alarm-style convention as Fault/Filament) the moment a print
   **finishes (or fails/cancels)** - not at print start - and automatically
-  clears itself after a configurable duration. Uses a Valve (not an Occupancy
-  Sensor) specifically because `SetDuration` is genuinely **adjustable
-  directly from the Home app** (a real +/- control on the accessory's detail
-  screen), not just via `airPurifierActiveDurationMinutes` in config -
-  adjusting it while the window is already running applies immediately as
-  "X minutes remaining from now." A new finish/fail resets the window rather
-  than letting an old one cut short a second back-to-back print's purifier
-  time. `Active`/`InUse`/`RemainingDuration` are computed/read-only and
-  revert any manual toggle; only `SetDuration` is meant to be changed by you.
-  If `useLiveActivity` is also on, the print's Live Activity tile extends
-  into a "purifying" phase (swapping to `liveActivityPurifierSymbol`, default
-  `aqi.medium` - confirmed to exist in Apple's SF Symbols catalogue, and a
-  distinct `liveActivityPurifierTint`, default `#0A84FF`) instead of ending
-  immediately at Finish - the tile's real end call is deferred until the
-  purifier window itself closes.
+  closes again after `airPurifierActiveDurationMinutes` (default 45). **Was
+  originally a Valve with a Home-app-adjustable duration** - switched after
+  real testing confirmed Home app's automation trigger picker doesn't offer
+  Valve accessories as a trigger source at all, only sensor types. Contact
+  Sensor is proven throughout this plugin (Fault/Filament/Door already use
+  it), so this trades the adjustable-duration convenience for something that
+  actually works as a trigger - duration is fixed via config only now. A new
+  finish/fail resets the window rather than letting an old one cut short a
+  second back-to-back print's purifier time. If `useLiveActivity` is also on,
+  the print's Live Activity tile extends into a "purifying" phase (swapping
+  to `liveActivityPurifierSymbol`, default `aqi.medium` - confirmed to exist
+  in Apple's SF Symbols catalogue, and a distinct `liveActivityPurifierTint`,
+  default `#0A84FF`) instead of ending immediately at Finish - the tile's
+  real end call is deferred until the purifier window itself closes.
+  **Won't end a tile that a new print has since claimed.** Since Pingie's
+  device-address is an upsert, starting a new print during the purifier
+  window reuses the same tile to track that print's own progress - the old
+  window's expiry now correctly checks whether a print is actually still
+  running before ending anything, rather than blindly killing the tile
+  regardless of what it's currently showing (a real bug: the old timer used
+  to end the Live Activity unconditionally, which could kill a tile that had
+  hours left on a completely different, still-running print if it happened
+  to start during the purifier window).
+  **Survives a Homebridge/plugin restart correctly** - the window's end time
+  is persisted to Homebridge's own durable accessory storage (everything else
+  in this plugin is in-memory only), so a restart mid-window resumes the
+  remaining time instead of always resetting to closed. This specifically
+  fixes a real bug: the Live Activity side always survived a restart for
+  free (Apple's ActivityKit ticks `endsIn` client-side, independent of the
+  plugin staying alive), but the HomeKit Contact Sensor had no equivalent and
+  would silently reset to closed on every restart - looking like the sensor
+  "reopened immediately" on the next real print finish, when actually the
+  previous window had just been wiped out from under it. Setting
+  `enableAirPurifierSensor: false` properly removes the tile from Home app on
+  the next restart (a real gap fixed alongside the above - it previously only
+  stopped creating new tiles, never removed an existing one).
 - A **Switch ("AMS Auto-Dry")** — experimental, opt-in (only appears if `amsId`
   is configured). Enables/disables automatic threshold-based AMS 2 Pro drying -
   not a direct dryer toggle, and deliberately not a humidity sensor tile. See
   **AMS 2 Pro auto-dry (experimental)** below - this one has real unresolved
   unknowns and needs calibration against your own logs.
+- A **Switch ("AI Auto-Pause")** — experimental, opt-in (only appears if
+  `enableAiAutoPauseOnSpaghetti` is configured). Unlike every other switch in
+  this plugin, this one's config flag only controls whether the tile exists -
+  the switch itself is the real gate, defaults off, and resets to off
+  automatically at the start of every new print, requiring a conscious
+  re-enable each time. See **⚠️ Optional: letting the AI autonomously
+  pause/resume the print** below.
 - A **Fan ("Progress")** — HomeKit has no native progress bar, so this repurposes
   a Fan's rotation-speed slider (0–100%) to show live print completion percentage,
   read straight from the printer's own `mc_percent` field rather than estimated
@@ -148,6 +177,8 @@ to tell apart at a glance:
 | Connection lost | ⚠️ Connection lost (after N failed reconnects, configurable) |
 | Connection restored | ✅ Connection restored |
 | Print failed/cancelled | ❌ Print failed |
+| Possible spaghetti defect | 🍝 Possible spaghetti detected (with live snapshot, optional AI assessment, optionally auto-paused, optionally an interactive Discord question) |
+| Spaghetti decision received | 🍝 Spaghetti decision received (once a Discord question resolves) |
 
 ## Live Activities (Lock Screen tile) instead of push notifications
 
@@ -184,6 +215,37 @@ How it maps onto data we already track:
   during the transient status moments below (heating, first layer check,
   purifying) so those messages are actually visible rather than buried under
   stale chips - resumes on the next regular progress update.
+- **A 7th "AI PAUSE" chip appears if `enableAiAutoPauseOnSpaghetti` is
+  configured** - shows `ON` (red) or `OFF` (grey) reflecting the live state
+  of the AI Auto-Pause switch. Since Pingie's dashboard has a hard cap of 6
+  chips, `LAYER` is dropped first to make room when everything else is
+  already filling the other 5 - the most redundant one given `PROGRESS`
+  already shows a percentage. Updates immediately when the switch is
+  toggled, not just on the next scheduled tick.
+- **Each chip's color is independently configurable** -
+  `liveActivityColorProgress`/`Layer`/`Speed`/`Material`/`Cost`/`Eta`, plain
+  hex (`#RRGGBB`), confirmed accepted by Pingie's own docs with no restricted
+  palette. Sensible defaults are set (orange progress, green cost, blue ETA,
+  etc.) so it looks reasonable before you touch anything. Schema fields use
+  `"format": "color"`, which *may* render an actual color picker if your
+  Homebridge UI version supports it - not guaranteed, so if you just see a
+  plain text box, type the hex code directly. **Note: the countdown text
+  itself (the `endsIn` value shown in the tile's top-right) isn't
+  independently colorable** - Pingie has no separate parameter for it, it
+  simply inherits the overall `tint`, same as the progress bar fill and icon
+  background. There's no way to make just the countdown a different color
+  without changing `tint` for the whole tile.
+- **The ETA chip's time zone is explicit** (`liveActivityTimezone`, default
+  `Europe/London`), not inferred from the host system's local clock setting.
+  This matters because Docker containers commonly default to UTC regardless
+  of the host machine's real location - relying on the system clock would
+  silently produce an ETA that's wrong by exactly one hour during BST, and
+  correct again in winter, which is a genuinely easy bug to miss until the
+  clocks actually change. **Verified directly**: running the calculation in
+  a UTC-configured process, the old system-clock-based method returned
+  `14:00` for an instant that's truly `15:00` in the UK during BST; the
+  explicit-timezone version returns the correct `15:00` regardless of the
+  underlying process's own timezone.
 - `endsIn` (seconds from now) is exactly `mc_remaining_time × 60` - iOS ticks
   the countdown locally after that with no further requests, refreshed on
   each progress update to stay accurate over a multi-hour print
@@ -217,10 +279,15 @@ How it maps onto data we already track:
   Inspecting first layer`) instead of sending a separate push, while a print
   using the Live Activity is active - reverts to the standard body line on
   the next regular progress update.
-- **`trailing` shows a clock-time ETA** (e.g. `22:23`) alongside the relative
-  countdown `endsIn` already provides - a fixed time-of-day estimate, not
-  just "how long from now." Switches to the final cost at Finish, same field
-  repurposed for its two sequential meanings.
+- **`trailing` shows the final cost at Finish** (no competing countdown at
+  that point, so it's actually visible there). **Correction from an earlier
+  version of this feature:** a clock-time ETA was previously also sent via
+  `trailing` during active printing, but Pingie's own documented priority
+  order for that display slot is countdown → trailing → step fraction →
+  status - since `endsIn` is set on essentially every progress update, the
+  countdown always wins and `trailing` never actually rendered during
+  printing. Removed; the ETA is still available via the `metrics` dashboard's
+  own ETA chip, which doesn't have this conflict.
 - **The icon swaps to `pause.fill` while paused**, back to the normal
   printing symbol on resume - reinforces the pause status visually, not just
   in the status text.
@@ -323,6 +390,17 @@ resulting `dist/` folder across - most Homebridge Docker images don't have
 TypeScript installed, so building directly on the NAS/container will fail.
 
 ## Configuration
+
+The Homebridge UI form groups everything into collapsible sections
+(Notifications, Cost Tracking, Live Activity, Air Purifier, and so on),
+each with a short one-line description under every field. Genuinely risky
+or unverified features (AMS 2 Pro auto-dry, AI autonomous pause/resume, the
+live camera snapshot, the AMS ID sniffer) are grouped together under a
+single **"⚠️ Experimental — Use With Caution"** section, collapsed by
+default, with longer descriptions explaining specifically what could go
+wrong with each one - everything else gets a concise one-sentence
+explanation instead. Only connection details (IP, serial, access code) are
+always visible; everything else is opt-in and tucked away until you need it.
 
 ```jsonc
 {
@@ -579,6 +657,158 @@ every finished print. Given the camera's single-connection limit caused a real
 issue earlier, this hasn't been battle-tested for similar contention - worth
 watching the printer's health after a few real prints before fully trusting it
 during something you care about.
+
+## Spaghetti detection with optional AI assessment
+
+Pulled out from the generic Fault notification into its own dedicated one -
+this deserves more than a one-line generic fault description. Always fires
+as a separate push regardless of `useLiveActivity` (same as
+Fault/Filament/Connection-lost) - this is squarely an error-category event,
+not something to fold into a progress tile.
+
+**Catches the signal via two separate code spaces, not just one.** Initially
+this only checked the HMS code `0C00-0300-0003-0008` ("Possible spaghetti
+defects") - but real-world testing found Bambu's firmware can *also* report
+this via `print_error` (a completely different code space), specifically
+`0300_8003` ("Spaghetti defects were detected by the AI Print Monitoring...")
+- confirmed directly from a real notification a user received, which the
+HMS-only check had silently missed entirely, letting it fall through to the
+generic Fault message instead. Two further related `print_error` codes
+(`0C00_8002`, `0C00_C004`) are also caught for the same reason. All three are
+excluded from the generic Fault aggregation too, so you get exactly one
+notification for the event, not a duplicate.
+
+**What happens on detection:**
+1. Captures a **live** camera snapshot specifically (via `includeCameraSnapshot`/
+   camera.ui - not the static 3MF-rendered preview thumbnail, even if
+   `includePrintPreviewImage` is on. A genuine current-state photo is the
+   whole point here.)
+2. If `enableAiSpaghettiAssessment: true` (off by default), sends that
+   snapshot to Anthropic's API (`anthropicApiKey`, your own key) for a brief
+   text take on whether it looks genuinely failed or still salvageable
+3. Sends one notification with the image and whatever text is available
+
+**This is important to be clear about:** by default, the AI assessment is
+**advisory only**. It has no ability to pause, stop, or otherwise act on the
+print - it's a text opinion attached to a notification, and you make the
+actual call yourself, same as you would from the photo alone. Every step
+degrades gracefully - no camera configured, a failed snapshot capture, AI
+assessment disabled or its own call failing - the notification still sends
+with whatever's actually available, never silently blocked by a missing
+piece.
+
+### ⚠️ Optional: letting the AI autonomously pause/resume the print
+
+`enableAiAutoPauseOnSpaghetti` (**off by default, worth thinking carefully
+about before turning on**) goes a real step further - if the AI judges a
+detected spaghetti defect to be a genuine failure, the plugin **pauses the
+print itself**, no human confirmation required. It's symmetric: if the print
+happens to already be paused when the AI weighs in (from this feature's own
+earlier pause, or any other reason) and the AI now judges it looks fine, the
+plugin **resumes it automatically** too.
+
+**This config flag only controls whether the toggle exists - it doesn't turn
+the behaviour on by itself.** Enabling it adds an **"AI Auto-Pause" HomeKit
+switch**, and *that switch* is the real, live gate - not the config file.
+The switch:
+- **Defaults off**, same as every other opt-in accessory in this plugin
+- **Resets to off automatically at the start of every new print** - not just
+  on a Homebridge restart. Even if you left it on from a previous print, a
+  fresh print always starts with it off, so there's no way for autonomous
+  behaviour to silently carry over without a conscious decision made
+  *during that specific print*
+- Logs clearly (both when the switch itself is flipped, and once at startup
+  explaining it exists) so it's never a surprise which state it's in
+
+A few more things worth being direct about:
+
+- **Only ever pause/resume - never a full cancel/abort.** Both are
+  reversible actions; a full stop is a one-way destructive action, same
+  reasoning as why the Pause switch itself never got a Stop control anywhere
+  in this plugin.
+- **This is genuinely more autonomous authority than Bambu's own first-party
+  AI monitoring exercises** - their system only ever flags a possible defect
+  for you to look at, it doesn't act on your behalf. This feature does.
+- **AI vision judgment from a single photo is fallible in both directions** -
+  wrongly pausing interrupts a print that was actually fine; wrongly
+  resuming lets a genuine failure keep running unsupervised.
+- **Fails toward inaction, not toward autonomous action.** The prompt asks
+  for a structured `VERDICT: PAUSE` / `VERDICT: CONTINUE` line specifically
+  so the response can be parsed safely - if the API call fails, or the
+  response doesn't include a parseable verdict line, neither action fires.
+  Only an explicit, successfully-parsed verdict that also differs from the
+  print's *current* state triggers anything - a "continue" verdict while
+  already running, or a "pause" verdict while already paused, is correctly a
+  no-op either way.
+- Logs a prominent warning at startup while this is enabled, so it's hard to
+  forget it's active.
+
+If you're not confident this is genuinely what you want, leave it off and
+rely on the notification-plus-photo version above instead - you'll still get
+the AI's opinion, just without it acting on the printer itself.
+
+## Discord bot - interactive pause/continue decisions
+
+A real alternative to the AI making the call alone: a Discord bot that sends
+the photo and asks you directly, waiting for an actual human response before
+anything happens.
+
+**Why Discord over something like WhatsApp:** Discord bots connect
+*outbound only*, via Discord's Gateway (a persistent WebSocket) - the exact
+same category of connection this plugin already keeps open to the printer
+via MQTT. No public server, no inbound ports, no webhook, no trusted HTTPS
+certificate needed at all. WhatsApp's Business API requires the opposite - a
+genuinely public-facing webhook endpoint - which is a meaningfully bigger,
+more exposed undertaking than anything else in this plugin. Discord's bot
+API is also entirely free, with no per-message billing.
+
+**Setup:** create a bot at the [Discord Developer
+Portal](https://discord.com/developers/applications), enable the
+"Message Content" privileged intent for it (Bot settings page), invite it to
+a small private server (just you + the bot is fine), and put its token in
+`discordBotToken`. For each person who should be asked, enable Developer
+Mode in Discord's own settings, right-click their name, Copy User ID, and
+add it to `discordUserIds`.
+
+**How a question gets answered:**
+- **React** with ✅ (continue) or 🛑 (pause) - the bot pre-adds both
+  reactions to its own message so you can just tap one
+- **Or just reply in plain English** - "yeah looks fine", "nah kill it",
+  whatever - interpreted via the same Anthropic key used for the visual
+  assessment (a cheap, separate text-classification call, not the vision
+  call). If your reply genuinely doesn't answer the question, the bot asks
+  you to clarify rather than guessing.
+
+**Multi-user support:** every configured user gets asked at once. Whoever
+responds first wins - their decision gets applied, and everyone else who
+was asked gets a follow-up message telling them who responded and what was
+decided, so they know not to bother and know what happened.
+
+**How this interacts with AI auto-pause mode:**
+- **AI gives a confident verdict** → already acted immediately (as normal) -
+  Discord just sends the photo plus an explanation of *why*, informational
+  only, no waiting.
+- **AI genuinely isn't sure** → escalates to the same interactive
+  question/wait flow as manual mode, instead of silently doing nothing.
+- **Auto-pause is off entirely** → always asks interactively, exactly like
+  the advisory-only assessment, just via Discord instead of (or alongside)
+  the Pingie notification.
+
+**The Pingie notification always states the AI's decision explicitly, even
+when no action was needed.** A real gap that's now fixed: previously, if the
+verdict was "continue" and the print was already running (the common case -
+nothing to actually resume), the notification said nothing at all about the
+decision reached, since text was only appended when a state change actually
+happened. Now it always says one of the two clearly - "✅ AI decided the
+print should continue - no action needed" or the equivalent for pause - so
+you always know what was decided, not just when something visibly changed.
+
+**The regular Pingie notification is never delayed by any of this** - it
+fires immediately with whatever's available synchronously, same as before.
+The Discord conversation runs independently in the background (which can
+genuinely take a long time, waiting for a human), and sends its own
+follow-up Pingie notification once someone actually responds, so there's a
+record even for someone not watching Discord at the time.
 
 ## AMS 2 Pro auto-dry (experimental)
 
